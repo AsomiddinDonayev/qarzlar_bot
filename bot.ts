@@ -1,5 +1,6 @@
 import "dotenv/config";
-import express from "express"; // <-- 1. Express import qilindi
+import express from "express";
+import cors from "cors"; // <-- 1. Express import qilindi
 import { timingSafeEqual, createHmac } from "node:crypto";
 import { Bot, Context, InlineKeyboard, GrammyError, HttpError } from "grammy";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -280,7 +281,7 @@ bot.on("callback_query:data", async (ctx) => {
 bot.catch((err) => {
   console.error(`Update ${err.ctx.update.update_id}:`, err.error);
   if (err.error instanceof GrammyError) console.error("Telegram:", err.error.description);
-  else if (err.error instanceof HttpError) console.error("Network:", err.error.description);
+  else if (err.error instanceof HttpError) console.error("Network:", err.error.message);
 });
 
 // ---------------------------------------------------------------------------
@@ -319,6 +320,13 @@ cron.schedule(CRON_SCHED, () => void sendReminders(), { timezone: CRON_TZ });
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-telegram-init-data"]
+}));
+app.use(express.json());
 
 app.get("/", (_req, res) => {
   res.send("Bot status: Active & Running");

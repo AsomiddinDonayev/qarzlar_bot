@@ -20,6 +20,8 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.8",
+    "@types/cors": "^2.8.19",
+    "cors": "^2.8.6",
     "dotenv": "^16.6.1",
     "express": "^4.22.2",
     "grammy": "^1.45.1",
