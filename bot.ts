@@ -1,4 +1,5 @@
 import "dotenv/config";
+import express from "express"; // <-- 1. Express import qilindi
 import { timingSafeEqual, createHmac } from "node:crypto";
 import { Bot, Context, InlineKeyboard, GrammyError, HttpError } from "grammy";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -279,7 +280,7 @@ bot.on("callback_query:data", async (ctx) => {
 bot.catch((err) => {
   console.error(`Update ${err.ctx.update.update_id}:`, err.error);
   if (err.error instanceof GrammyError) console.error("Telegram:", err.error.description);
-  else if (err.error instanceof HttpError) console.error("Network:", err.error);
+  else if (err.error instanceof HttpError) console.error("Network:", err.error.description);
 });
 
 // ---------------------------------------------------------------------------
@@ -313,7 +314,22 @@ async function sendReminders(): Promise<void> {
 cron.schedule(CRON_SCHED, () => void sendReminders(), { timezone: CRON_TZ });
 
 // ---------------------------------------------------------------------------
-// Start
+// Express Web Server (Render portini qanoatlantirish uchun)
+// ---------------------------------------------------------------------------
+
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.get("/", (_req, res) => {
+  res.send("Bot status: Active & Running");
+});
+
+app.listen(PORT, () => {
+  console.log(`HTTP Server running on port ${PORT}`);
+});
+
+// ---------------------------------------------------------------------------
+// Start Bot
 // ---------------------------------------------------------------------------
 
 console.log(`Bot starting. Cron: "${CRON_SCHED}" (${CRON_TZ})`);
