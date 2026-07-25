@@ -1,0 +1,7 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.bot.json" },
+    { "path": "./mini-app" }
+  ]
+}
