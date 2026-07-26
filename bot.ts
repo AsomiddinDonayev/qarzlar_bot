@@ -319,7 +319,7 @@ cron.schedule(CRON_SCHED, () => void sendReminders(), { timezone: CRON_TZ });
 // ---------------------------------------------------------------------------
 
 const app = express();
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT) || 10000;
 
 app.use(cors({
   origin: "*",
@@ -332,10 +332,9 @@ app.get("/", (_req, res) => {
   res.send("Bot status: Active & Running");
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`HTTP Server running on port ${PORT}`);
 });
-
 // ---------------------------------------------------------------------------
 // Start Bot
 // ---------------------------------------------------------------------------
