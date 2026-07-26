@@ -341,5 +341,14 @@ app.listen(PORT, "0.0.0.0", () => {
 
 console.log(`Bot starting. Cron: "${CRON_SCHED}" (${CRON_TZ})`);
 void bot.start({ onStart: (i) => console.log(`@${i.username} running`) });
-process.once("SIGINT",  () => bot.stop());
+// Render qayta yoqilganda eski ulanishlarni to'xtatish uchun Graceful Shutdown
+process.once("SIGINT", () => bot.stop());
 process.once("SIGTERM", () => bot.stop());
+
+// Botni eski so'rovlarni o'tkazib yuborgan holda ishga tushirish
+bot.start({
+  drop_pending_updates: true,
+  onStart: (botInfo) => {
+    console.log(`@${botInfo.username} running`);
+  },
+});
