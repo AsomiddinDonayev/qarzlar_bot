@@ -31,7 +31,7 @@ const SUPA_URL    = getEnv("SUPABASE_URL");
 const SUPA_KEY    = getEnv("SUPABASE_SERVICE_ROLE_KEY");
 const WEBAPP_URL  = getEnv("WEBAPP_URL");
 const CRON_SCHED  = process.env.CRON_SCHEDULE ?? "0 9 * * *";
-const CRON_TZ     = process.env.CRON_TZ        ?? "Asia/Tashkent";
+const CRON_TZ     = process.env.CRON_TZ       ?? "Asia/Tashkent";
 const DEFER_DAYS  = envInt("DEFER_DAYS", 3);
 const RENDER_URL  = process.env.RENDER_EXTERNAL_URL || process.env.SERVER_URL || "";
 
@@ -68,11 +68,15 @@ interface DueDebt {
 // ---------------------------------------------------------------------------
 
 async function getUser(telegramId: number): Promise<UserRow | null> {
-  const { data } = await db
+  // O'ZGARISH: error o'zgaruvchisi ham olindi va tekshirildi
+  const { data, error } = await db
     .from("users")
     .select("telegram_id, business_id, role, full_name")
     .eq("telegram_id", telegramId)
     .maybeSingle();
+    
+  if (error) throw new Error(error.message);
+  
   return data as UserRow | null;
 }
 
@@ -337,6 +341,12 @@ app.use(express.json());
 // Telegram Webhook Marshruti
 const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`;
 app.use(WEBHOOK_PATH, webhookCallback(bot, "express"));
+
+// O'ZGARISH: Frontend'dan keladigan so'rovlar uchun marshrut qo'shildi
+app.post("/auth/telegram", (req, res) => {
+  // Bu yerda frontend dan keladigan so'rovlarni qabul qilasiz
+  res.json({ success: true, message: "Ulanish muvaffaqiyatli" });
+});
 
 app.get("/", (_req, res) => {
   res.send("Nasiya Daftari API & Bot is running.");
