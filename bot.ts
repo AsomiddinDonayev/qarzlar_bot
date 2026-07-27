@@ -261,13 +261,10 @@ bot.command("start", async (ctx) => {
 
     const active = await isBusinessActive(user.business_id);
     if (!active) {
-      await ctx.reply(
-        `⚠️ <b>Obuna faol emas!</b>\n\n` +
-        `Hurmatli <b>${user.full_name || 'Foydalanuvchi'}</b>, tizimdan to'liq foydalanish uchun oylik obuna to'lovini amalga oshirishingiz kerak.\n\n` +
-        `💳 <b>Karta:</b> <code>9860 1234 5678 9012</code> (Asomiddin D.)\n` +
-        `📞 To'lov qilgandan so'ng chekni adminga yuboring va tasdiqlating.`,
-        { parse_mode: "HTML" }
-      );
+  // Obuna yoki biznes aktivligini tekshirish kodi ichida:
+  await ctx.reply(
+  `⚠️ **Diqqat!**\n\nSizning biznesingiz hali aktiv holatida emas.`
+  );
       return;
     }
 
