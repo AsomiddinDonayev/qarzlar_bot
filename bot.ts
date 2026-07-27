@@ -602,27 +602,27 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
 
-    if (data.startsWith("admin:activate:")) {
+if (data.startsWith("admin:activate:")) {
       const bizId = data.split(":")[2];
       await db.from("businesses").update({ is_active: true }).eq("id", bizId);
 
       const ownerId = await getOwnerTelegramId(bizId);
       if (ownerId) {
-       // YANGI KOD:
-try {
-  await ctx.editMessageText("✅ Biznes muvaffaqiyatli faollashtirildi!");
-  await ctx.answerCallbackQuery({
-    text: "Muvaffaqiyatli bajarildi!",
-  });
-} catch (error: any) {
-  // Agar xatolik faqat "message is not modified" bo'lsa, uni e'tiborsiz qoldiramiz
-  if (!error.description?.includes("message is not modified")) {
-    throw error;
-  }
-        await ctx.answerCallbackQuery({
-          text: "Bu biznes allaqachon faollashtirilgan!",
-        });
+        try {
+          await ctx.editMessageText("✅ Biznes muvaffaqiyatli faollashtirildi!");
+          await ctx.answerCallbackQuery({
+            text: "Muvaffaqiyatli bajarildi!",
+          });
+        } catch (error: any) {
+          if (!error.description?.includes("message is not modified")) {
+            throw error;
+          }
+          await ctx.answerCallbackQuery({
+            text: "Bu biznes allaqachon faollashtirilgan!",
+          });
+        }
       }
+      return; // <-- Har bir shart oxirida return bo'lishi kerak
     }
     if (data === "admin:stats") {
       const { data: businesses } = await db.from("businesses").select("id, name, is_active");
