@@ -1,6 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import crypto from "crypto";
+import rateLimit from "express-rate-limit";
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import cron from "node-cron";
@@ -67,6 +69,37 @@ interface DueDebt {
 }
 
 // ---------------------------------------------------------------------------
+// Security: Telegram WebApp initData Validator
+// ---------------------------------------------------------------------------
+function validateTelegramInitData(initData: string, botToken: string): number | null {
+  try {
+    const urlParams = new URLSearchParams(initData);
+    const hash = urlParams.get("hash");
+    if (!hash) return null;
+    
+    urlParams.delete("hash");
+    const params: string[] = [];
+    urlParams.sort();
+    for (const [key, value] of urlParams.entries()) {
+      params.push(`${key}=${value}`);
+    }
+    const dataCheckString = params.join("\n");
+
+    const secretKey = crypto.createHmac("sha256", "WebAppData").update(botToken).digest();
+    const calculatedHash = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
+
+    if (calculatedHash !== hash) return null;
+
+    const userParam = urlParams.get("user");
+    if (!userParam) return null;
+    const userObj = JSON.parse(userParam);
+    return userObj.id ? Number(userObj.id) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Database Helpers
 // ---------------------------------------------------------------------------
 
@@ -82,7 +115,6 @@ async function getUser(telegramId: number): Promise<UserRow | null> {
 }
 
 async function registerOwner(telegramId: number, fullName: string): Promise<UserRow> {
-  // New businesses are inactive by default until admin approves
   const { data: biz, error: bizErr } = await db
     .from("businesses")
     .insert({ name: fullName, phone: "", is_active: false })
@@ -263,9 +295,6 @@ bot.command("start", async (ctx) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Admin Panel Command (/admin)
-// ---------------------------------------------------------------------------
 bot.command("admin", async (ctx) => {
   if (!ctx.from) return;
   if (ADMIN_TELEGRAM_ID && ctx.from.id !== ADMIN_TELEGRAM_ID) {
@@ -287,9 +316,6 @@ bot.command("admin", async (ctx) => {
   );
 });
 
-// ---------------------------------------------------------------------------
-// Taklif va Shikoyatlar Menu Listener
-// ---------------------------------------------------------------------------
 bot.hears("💬 Taklif va Shikoyatlar", async (ctx) => {
   if (!ctx.from) return;
   const user = await getUser(ctx.from.id);
@@ -306,7 +332,6 @@ bot.hears("💬 Taklif va Shikoyatlar", async (ctx) => {
   });
 });
 
-// Capture text messages for feedback or admin broadcast
 bot.on("message:text", async (ctx, next) => {
   if (!ctx.from) return next();
   const userId = ctx.from.id;
@@ -314,7 +339,6 @@ bot.on("message:text", async (ctx, next) => {
 
   if (text.startsWith("/")) return next();
 
-  // Admin Broadcast text capture
   if (ADMIN_TELEGRAM_ID && userId === ADMIN_TELEGRAM_ID && adminWaitingForBroadcast.has(userId)) {
     adminWaitingForBroadcast.delete(userId);
     const { data: allUsers } = await db.from("users").select("telegram_id");
@@ -337,7 +361,6 @@ bot.on("message:text", async (ctx, next) => {
     return;
   }
 
-  // User feedback capture
   if (userFeedbackType.has(userId)) {
     const type = userFeedbackType.get(userId)!;
     userFeedbackType.delete(userId);
@@ -476,7 +499,6 @@ bot.on("callback_query:data", async (ctx) => {
   if (!ctx.from) return;
   const data = ctx.callbackQuery.data;
 
-  // Profile Deletion Flow
   if (data === "profile:delete_prompt") {
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
@@ -540,7 +562,6 @@ bot.on("callback_query:data", async (ctx) => {
     return;
   }
 
-  // Feedback Type Selection
   if (data.startsWith("fb_type:")) {
     const type = data.split(":")[1];
     userFeedbackType.set(ctx.from.id, type);
@@ -549,7 +570,6 @@ bot.on("callback_query:data", async (ctx) => {
     return;
   }
 
-  // Admin Actions
   if (data.startsWith("admin:")) {
     if (ADMIN_TELEGRAM_ID && ctx.from.id !== ADMIN_TELEGRAM_ID) {
       await ctx.answerCallbackQuery({ text: "Ruxsat yo'q" });
@@ -589,7 +609,6 @@ bot.on("callback_query:data", async (ctx) => {
       const bizId = data.split(":")[2];
       await db.from("businesses").update({ is_active: true }).eq("id", bizId);
 
-      // Notify owner if possible
       const ownerId = await getOwnerTelegramId(bizId);
       if (ownerId) {
         try {
@@ -633,7 +652,6 @@ bot.on("callback_query:data", async (ctx) => {
     }
   }
 
-  // Debt Actions
   const match = /^(pay|defer):([0-9a-f-]{36})$/.exec(data);
   if (!match) { await ctx.answerCallbackQuery({ text: "Xato" }); return; }
 
@@ -701,7 +719,7 @@ async function sendReminders(): Promise<void> {
   if (!debts.length) return;
 
   for (const debt of debts) {
-    if (!(await isBusinessActive(debt.business_id))) continue; // Skip inactive businesses
+    if (!(await isBusinessActive(debt.business_id))) continue;
     const ownerId = await getOwnerTelegramId(debt.business_id);
     if (!ownerId) continue;
     try {
@@ -716,7 +734,7 @@ async function sendReminders(): Promise<void> {
 cron.schedule(CRON_SCHED, () => void sendReminders(), { timezone: CRON_TZ });
 
 // ---------------------------------------------------------------------------
-// Express Web Server Setup
+// Express Web Server Setup & Security Limiter
 // ---------------------------------------------------------------------------
 
 const app = express();
@@ -725,17 +743,34 @@ const PORT = Number(process.env.PORT) || 10000;
 app.use(cors());
 app.use(express.json());
 
+// Rate Limiter: Bitta IP'dan 15 daqiqada ko'pi bilan 100 ta so'rov kelishiga ruxsat beriladi (DDoS himoya)
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: "Juda ko'p so'rov yuborildi. Birozdan so'ng urinib ko'ring." }
+});
+
+app.use("/auth/telegram", limiter);
+
 const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`;
 app.use(WEBHOOK_PATH, webhookCallback(bot, "express"));
 
-// Secured Telegram Auth API endpoint for WebApp
+// Secured Telegram WebApp Auth API endpoint (initData orqali kriptografik tekshiruv)
 app.post("/auth/telegram", async (req, res) => {
   try {
-    const { telegram_id } = req.body;
-    if (!telegram_id) {
-      return res.status(400).json({ success: false, error: "Telegram ID talab qilinadi" });
+    const { initData } = req.body;
+    if (!initData) {
+      return res.status(400).json({ success: false, error: "initData talab qilinadi" });
     }
-    const user = await getUser(Number(telegram_id));
+
+    const telegramId = validateTelegramInitData(initData, BOT_TOKEN);
+    if (!telegramId) {
+      return res.status(401).json({ success: false, error: "Autentifikatsiyadan o'tmadi (Xavfsizlik xatosi)" });
+    }
+
+    const user = await getUser(telegramId);
     if (!user) {
       return res.status(401).json({ success: false, error: "Foydalanuvchi topilmadi" });
     }
@@ -745,21 +780,21 @@ app.post("/auth/telegram", async (req, res) => {
       return res.status(403).json({ success: false, error: "Obuna faol emas" });
     }
 
-    res.json({ success: true, message: "Ulanish muvaffaqiyatli" });
+    res.json({ success: true, message: "Ulanish muvaffaqiyatli", business_id: user.business_id });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.get("/", (_req, res) => {
-  res.send("Nasiya Daftari API & Bot is running.");
+  res.send("Nasiya Daftari API & Bot is running securely.");
 });
 
 process.once("SIGINT", () => bot.stop());
 process.once("SIGTERM", () => bot.stop());
 
 app.listen(PORT, "0.0.0.0", async () => {
-  console.log(`HTTP Server running on port ${PORT}`);
+  console.log(`Secure HTTP Server running on port ${PORT}`);
 
   if (RENDER_URL) {
     const cleanUrl = RENDER_URL.replace(/\/$/, "");
