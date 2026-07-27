@@ -82,9 +82,10 @@ async function getUser(telegramId: number): Promise<UserRow | null> {
 }
 
 async function registerOwner(telegramId: number, fullName: string): Promise<UserRow> {
+  // New businesses are inactive by default until admin approves
   const { data: biz, error: bizErr } = await db
     .from("businesses")
-    .insert({ name: fullName, phone: "" })
+    .insert({ name: fullName, phone: "", is_active: false })
     .select("id")
     .single();
   if (bizErr) throw new Error(`[Supabase Biz] ${bizErr.message}`);
@@ -96,6 +97,16 @@ async function registerOwner(telegramId: number, fullName: string): Promise<User
     .single();
   if (userErr) throw new Error(`[Supabase User] ${userErr.message}`);
   return user as UserRow;
+}
+
+async function isBusinessActive(businessId: string): Promise<boolean> {
+  const { data } = await db
+    .from("businesses")
+    .select("is_active, deleted_at")
+    .eq("id", businessId)
+    .maybeSingle();
+  if (!data || data.deleted_at || !data.is_active) return false;
+  return true;
 }
 
 async function fetchDueDebts(): Promise<DueDebt[]> {
@@ -210,11 +221,22 @@ bot.command("start", async (ctx) => {
     if (!user) {
       user = await registerOwner(ctx.from.id, displayName(ctx.from));
     } else {
-      // Check if business is deleted
       const { data: biz } = await db.from("businesses").select("deleted_at").eq("id", user.business_id).maybeSingle();
       if (biz?.deleted_at) {
         await db.from("businesses").update({ deleted_at: null }).eq("id", user.business_id);
       }
+    }
+
+    const active = await isBusinessActive(user.business_id);
+    if (!active) {
+      await ctx.reply(
+        `⚠️ <b>Obuna faol emas!</b>\n\n` +
+        `Hurmatli <b>${user.full_name || 'Foydalanuvchi'}</b>, tizimdan to'liq foydalanish uchun oylik obuna to'lovini amalga oshirishingiz kerak.\n\n` +
+        `💳 <b>Karta:</b> <code>9860 1234 5678 9012</code> (Asomiddin D.)\n` +
+        `📞 To'lov qilgandan so'ng chekni adminga yuboring va tasdiqlating.`,
+        { parse_mode: "HTML" }
+      );
+      return;
     }
 
     const roleText = user.role === "owner" ? "Egasi" : "Menejer";
@@ -258,6 +280,7 @@ bot.command("admin", async (ctx) => {
       parse_mode: "HTML",
       reply_markup: new InlineKeyboard()
         .text("📊 Aktivlik va Statistika", "admin:stats").row()
+        .text("📋 Tasdiqlashni kutayotganlar", "admin:pending_biz").row()
         .text("📥 Murojaat va Fikrlar", "admin:messages").row()
         .text("📢 Hammaga xabar yuborish", "admin:broadcast"),
     }
@@ -269,6 +292,12 @@ bot.command("admin", async (ctx) => {
 // ---------------------------------------------------------------------------
 bot.hears("💬 Taklif va Shikoyatlar", async (ctx) => {
   if (!ctx.from) return;
+  const user = await getUser(ctx.from.id);
+  if (!user || !(await isBusinessActive(user.business_id))) {
+    await ctx.reply("⚠️ Avval obunani faollashtiring.");
+    return;
+  }
+
   await ctx.reply("Ariza turini tanlang:", {
     reply_markup: new InlineKeyboard()
       .text("⚠️ Shikoyat", "fb_type:shikoyat")
@@ -304,7 +333,7 @@ bot.on("message:text", async (ctx, next) => {
       }
     }
 
-    await ctx.reply(`✅ Xabar tarqatish yakunlandi!\n• Muvaffaqiyatli: ${success} ta\n• Xatolik (bloklaganlar): ${failed} ta`);
+    await ctx.reply(`✅ Xabar tarqatish yakunlandi!\n• Muvaffaqiyatli: ${success} ta\n• Xatolik: ${failed} ta`);
     return;
   }
 
@@ -320,13 +349,7 @@ bot.on("message:text", async (ctx, next) => {
       type: type
     });
 
-    const typeNames: Record<string, string> = {
-      shikoyat: "Shikoyatingiz",
-      taklif: "Taklifingiz",
-      izoh: "Izohingiz"
-    };
-
-    await ctx.reply(`✅ ${typeNames[type] || "Murojaatingiz"} muvaffaqiyatli qabul qilindi! Rahmat.`);
+    await ctx.reply(`✅ Murojaatingiz qabul qilindi! Rahmat.`);
 
     if (ADMIN_TELEGRAM_ID) {
       const typeEmoji: Record<string, string> = { shikoyat: "⚠️", taklif: "💡", izoh: "💬" };
@@ -345,6 +368,13 @@ bot.on("message:text", async (ctx, next) => {
 });
 
 bot.hears("📒 Nasiya Daftarini ochish (WebApp)", async (ctx) => {
+  if (!ctx.from) return;
+  const user = await getUser(ctx.from.id);
+  if (!user || !(await isBusinessActive(user.business_id))) {
+    await ctx.reply("⚠️ Tizimdan foydalanish uchun obunangiz faol bo'lishi kerak.");
+    return;
+  }
+
   await ctx.reply("Quyidagi tugma orqali ilovani oching:", {
     reply_markup: new InlineKeyboard().webApp("🚀 WebApp-ni ochish", WEBAPP_URL),
   });
@@ -356,7 +386,7 @@ bot.hears("⚙️ Profilni ko'rish", async (ctx) => {
     const user = await getUser(ctx.from.id);
     if (!user) { await ctx.reply("Avval /start bosing."); return; }
 
-    const { data: biz } = await db.from("businesses").select("name, phone, deleted_at").eq("id", user.business_id).maybeSingle();
+    const { data: biz } = await db.from("businesses").select("name, phone, is_active, deleted_at").eq("id", user.business_id).maybeSingle();
     
     if (biz?.deleted_at) {
       await ctx.reply("⚠️ Sizning profilingiz o'chirish jarayonida. 1 soat ichida ortga qaytarishingiz mumkin.", {
@@ -365,10 +395,13 @@ bot.hears("⚙️ Profilni ko'rish", async (ctx) => {
       return;
     }
 
+    const subStatus = biz?.is_active ? "✅ Faol (Obuna to'langan)" : "❌ Faol emas (Obuna kutilmoqda)";
+
     await ctx.reply(
       `⚙️ <b>Sizning Profilingiz:</b>\n\n` +
       `👤 Ism: <b>${user.full_name || 'Ko\'rsatilmagan'}</b>\n` +
       `🏢 Do'kon/Biznes: <b>${biz?.name || 'Noma\'lum'}</b>\n` +
+      `📦 Obuna holati: <b>${subStatus}</b>\n` +
       `💼 Rol: <b>${user.role === 'owner' ? 'Rahbar (Owner)' : 'Menejer'}</b>\n` +
       `🆔 Biznes ID: <code>${user.business_id}</code>`,
       {
@@ -386,7 +419,10 @@ bot.hears("📊 Statistika va Hisobotlar", async (ctx) => {
   if (!ctx.from) return;
   try {
     const user = await getUser(ctx.from.id);
-    if (!user) { await ctx.reply("Avval /start bosing."); return; }
+    if (!user || !(await isBusinessActive(user.business_id))) {
+      await ctx.reply("⚠️ Obuna faol emas.");
+      return;
+    }
 
     const { data: debts, error } = await db
       .from("debts")
@@ -434,7 +470,7 @@ bot.hears("📊 Statistika va Hisobotlar", async (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// Callbacks (Feedback, Admin Actions, Profile Deletion & Undo)
+// Callbacks
 // ---------------------------------------------------------------------------
 bot.on("callback_query:data", async (ctx) => {
   if (!ctx.from) return;
@@ -445,9 +481,7 @@ bot.on("callback_query:data", async (ctx) => {
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
       `⚠️ <b>Diqqat! Profilni o'chirish</b>\n\n` +
-      `Haqiqatan ham profilingiz va barcha ma'lumotlaringizni o'chirmoqchimisiz? ` +
-      `Bu amalni bajarishingiz bilan profil o'chirish jarayoniga qo'yiladi va uni <b>1 soat ichida</b> ortga qaytarish (undo) imkoningiz bo'ladi. ` +
-      `1 soatdan keyin barcha ma'lumotlar bazadan butunlay o'chib ketadi.`,
+      `Haqiqatan ham profilingiz va barcha ma'lumotlaringizni o'chirmoqchimisiz? 1 soat ichida tiklab olishingiz mumkin.`,
       {
         parse_mode: "HTML",
         reply_markup: new InlineKeyboard()
@@ -461,9 +495,7 @@ bot.on("callback_query:data", async (ctx) => {
   if (data === "profile:delete_confirm") {
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
-      `🔴 <b>Oxirgi tasdiqlash!</b>\n\n` +
-      `Siz rostdan ham barcha ma'lumotlaringizni o'chirib yubormoqchimisiz? ` +
-      `"Tasdiqlash" tugmasini bosganingizdan so'ng 1 soatlik qaytarish vaqti boshlanadi.`,
+      `🔴 <b>Oxirgi tasdiqlash!</b> Tasdiqlaysizmi?`,
       {
         parse_mode: "HTML",
         reply_markup: new InlineKeyboard()
@@ -482,17 +514,14 @@ bot.on("callback_query:data", async (ctx) => {
 
   if (data === "profile:delete_final") {
     const user = await getUser(ctx.from.id);
-    if (!user) { await ctx.answerCallbackQuery({ text: "Foydalanuvchi topilmadi" }); return; }
+    if (!user) { await ctx.answerCallbackQuery({ text: "Topilmadi" }); return; }
 
     const nowIso = new Date().toISOString();
     await db.from("businesses").update({ deleted_at: nowIso }).eq("id", user.business_id);
 
-    await ctx.answerCallbackQuery({ text: "Profil o'chirishga qo'yildi" });
+    await ctx.answerCallbackQuery({ text: "O'chirishga qo'yildi" });
     await ctx.editMessageText(
-      `⚠️ <b>Profil o'chirishga belgilandi!</b>\n\n` +
-      `Sizning profilingiz va biznesingiz o'chirish jarayoniga kiritildi. ` +
-      `Agar fikringiz o'zgatsa, keyingi <b>1 soat ichida</b> pastdagi tugmani bosib uni tiklab qolishingiz mumkin.\n\n` +
-      `Aks holda, vaqt tugagach bazadan butunlay o'chib ketadi.`,
+      `⚠️ <b>Profil o'chirishga belgilandi!</b> 1 soat ichida tiklashingiz mumkin.`,
       {
         parse_mode: "HTML",
         reply_markup: new InlineKeyboard().text("🔄 Profilni tiklash (Undo)", "profile:undo")
@@ -503,11 +532,11 @@ bot.on("callback_query:data", async (ctx) => {
 
   if (data === "profile:undo") {
     const user = await getUser(ctx.from.id);
-    if (!user) { await ctx.answerCallbackQuery({ text: "Foydalanuvchi topilmadi" }); return; }
+    if (!user) { await ctx.answerCallbackQuery({ text: "Topilmadi" }); return; }
 
     await db.from("businesses").update({ deleted_at: null }).eq("id", user.business_id);
-    await ctx.answerCallbackQuery({ text: "Profil muvaffaqiyatli tiklandi!" });
-    await ctx.editMessageText("✅ Profilingiz muvaffaqiyatli tiklandi va yana faol holatga o'tdi!");
+    await ctx.answerCallbackQuery({ text: "Profil tiklandi!" });
+    await ctx.editMessageText("✅ Profilingiz muvaffaqiyatli tiklandi!");
     return;
   }
 
@@ -516,21 +545,11 @@ bot.on("callback_query:data", async (ctx) => {
     const type = data.split(":")[1];
     userFeedbackType.set(ctx.from.id, type);
     await ctx.answerCallbackQuery();
-    
-    const titles: Record<string, string> = {
-      shikoyat: "Shikoyat",
-      taklif: "Taklif",
-      izoh: "Izoh"
-    };
-
-    await ctx.editMessageText(
-      `Iltimos, o'z <b>${titles[type] || 'murojaatingiz'}</b> matnini shu yerga yozib yuboring:`,
-      { parse_mode: "HTML" }
-    );
+    await ctx.editMessageText(`Iltimos, o'z murojaatingiz matnini yozib yuboring:`, { parse_mode: "HTML" });
     return;
   }
 
-  // Admin Panel Actions
+  // Admin Actions
   if (data.startsWith("admin:")) {
     if (ADMIN_TELEGRAM_ID && ctx.from.id !== ADMIN_TELEGRAM_ID) {
       await ctx.answerCallbackQuery({ text: "Ruxsat yo'q" });
@@ -540,104 +559,118 @@ bot.on("callback_query:data", async (ctx) => {
     if (data === "admin:broadcast") {
       adminWaitingForBroadcast.add(ctx.from.id);
       await ctx.answerCallbackQuery();
-      await ctx.editMessageText(
-        `📢 <b>Ommaviy xabar yuborish</b>\n\n` +
-        `Barcha bot foydalanuvchilariga yubormoqchi bo'lgan xabaringizni (matn, rasm matni va hokazo) shu chatga yozib yuboring:`,
-        { parse_mode: "HTML" }
-      );
+      await ctx.editMessageText(`📢 Hammaga yuboriladigan xabarni yozing:`, { parse_mode: "HTML" });
+      return;
+    }
+
+    if (data === "admin:pending_biz") {
+      const { data: pending } = await db
+        .from("businesses")
+        .select("id, name, phone, created_at")
+        .eq("is_active", false)
+        .is("deleted_at", null);
+
+      if (!pending || pending.length === 0) {
+        await ctx.answerCallbackQuery({ text: "Tasdiqlashni kutayotganlar yo'q" });
+        return;
+      }
+
+      const kb = new InlineKeyboard();
+      pending.forEach((b: any) => {
+        kb.text(`✅ ${b.name || 'Nomsiz'}`, `admin:activate:${b.id}`).row();
+      });
+
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(`📋 <b>Tasdiqlashni kutayotgan bizneslar:</b>`, { parse_mode: "HTML", reply_markup: kb });
+      return;
+    }
+
+    if (data.startsWith("admin:activate:")) {
+      const bizId = data.split(":")[2];
+      await db.from("businesses").update({ is_active: true }).eq("id", bizId);
+
+      // Notify owner if possible
+      const ownerId = await getOwnerTelegramId(bizId);
+      if (ownerId) {
+        try {
+          await bot.api.sendMessage(ownerId, "🎉 <b>Tabriklaymiz!</b> Obunangiz admin tomonidan tasdiqlandi. Endi bot va ilovadan to'liq foydalanishingiz mumkin! /start bosing.", { parse_mode: "HTML" });
+        } catch (e) {}
+      }
+
+      await ctx.answerCallbackQuery({ text: "Biznes faollashtirildi!" });
+      await ctx.editMessageText(`✅ Biznes muvaffaqiyatli faollashtirildi!`);
       return;
     }
 
     if (data === "admin:stats") {
-      const { data: businesses } = await db.from("businesses").select("id, name, phone, created_at");
-      const { data: allDebts } = await db.from("debts").select("business_id, created_at");
-
+      const { data: businesses } = await db.from("businesses").select("id, name, is_active");
       const totalBiz = businesses?.length || 0;
-      const now = new Date();
-      const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-
-      let activeCount = 0;
-      let inactiveCount = 0;
-
-      businesses?.forEach((biz: any) => {
-        const bizDebts = allDebts?.filter((d: any) => d.business_id === biz.id) || [];
-        const hasRecentActivity = bizDebts.some((d: any) => new Date(d.created_at) >= sevenDaysAgo);
-        if (hasRecentActivity) {
-          activeCount++;
-        } else {
-          inactiveCount++;
-        }
-      });
+      const activeBiz = businesses?.filter((b: any) => b.is_active)?.length || 0;
 
       await ctx.answerCallbackQuery();
       await ctx.editMessageText(
-        `📊 <b>Tizim Statistikasi va Faollik</b>\n\n` +
-        `🏢 Jami ro'yxatdan o'tgan bizneslar: <b>${totalBiz} ta</b>\n` +
-        `🟢 Faol bizneslar (oxirgi 7 kunda): <b>${activeCount} ta</b>\n` +
-        `🔴 Nofaol / Passiv bizneslar: <b>${inactiveCount} ta</b>`,
+        `📊 <b>Statistika</b>\n\n` +
+        `🏢 Jami bizneslar: <b>${totalBiz} ta</b>\n` +
+        `✅ Faol obunadagilar: <b>${activeBiz} ta</b>`,
         { parse_mode: "HTML" }
       );
       return;
     }
 
     if (data === "admin:messages") {
-      const { data: msgs } = await db
-        .from("bot_feedback")
-        .select("full_name, telegram_id, text, type, created_at")
-        .order("created_at", { ascending: false })
-        .limit(10);
-
+      const { data: msgs } = await db.from("bot_feedback").select("*").order("created_at", { ascending: false }).limit(10);
       if (!msgs || msgs.length === 0) {
         await ctx.answerCallbackQuery({ text: "Murojaatlar yo'q" });
         return;
       }
-
-      let textReport = "📥 <b>So'nggi Murojaat va Fikrlar:</b>\n\n";
-      msgs.forEach((m: any, idx: number) => {
-        textReport += `${idx + 1}. [<b>${m.type.toUpperCase()}</b>] ${m.full_name} (<code>${m.telegram_id}</code>):\n💬 ${m.text}\n\n`;
+      let textReport = "📥 <b>Murojaatlar:</b>\n\n";
+      msgs.forEach((m: any, i: number) => {
+        textReport += `${i + 1}. [${m.type.toUpperCase()}] ${m.full_name}: ${m.text}\n\n`;
       });
-
       await ctx.answerCallbackQuery();
       await ctx.editMessageText(textReport, { parse_mode: "HTML" });
       return;
     }
   }
 
-  // Debt Actions (Pay / Defer)
+  // Debt Actions
   const match = /^(pay|defer):([0-9a-f-]{36})$/.exec(data);
-  if (!match) { await ctx.answerCallbackQuery({ text: "Noto'g'ri so'rov" }); return; }
+  if (!match) { await ctx.answerCallbackQuery({ text: "Xato" }); return; }
 
   const [, action, debtId] = match;
   try {
     const user = await getUser(ctx.from.id);
-    if (!user) { await ctx.answerCallbackQuery({ text: "Avval /start bosing." }); return; }
+    if (!user || !(await isBusinessActive(user.business_id))) {
+      await ctx.answerCallbackQuery({ text: "Obuna faol emas" });
+      return;
+    }
 
     if (action === "pay") {
       const ok = await markDebtPaid(debtId, user.business_id);
-      if (!ok) { await ctx.answerCallbackQuery({ text: "Qarz topilmadi yoki allaqachon yopilgan" }); return; }
-      await ctx.answerCallbackQuery({ text: "✅ To'lov qabul qilindi" });
+      if (!ok) { await ctx.answerCallbackQuery({ text: "Topilmadi" }); return; }
+      await ctx.answerCallbackQuery({ text: "✅ To'landi" });
       await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-      await ctx.reply("✅ Nasiya to'langan deb belgilandi.");
+      await ctx.reply("✅ Nasiya to'landi.");
       return;
     }
 
     const newDue = await deferDebt(debtId, user.business_id, DEFER_DAYS);
-    if (!newDue) { await ctx.answerCallbackQuery({ text: "Qarz topilmadi" }); return; }
-    await ctx.answerCallbackQuery({ text: `⏳ ${DEFER_DAYS} kunga surildi` });
+    if (!newDue) { await ctx.answerCallbackQuery({ text: "Topilmadi" }); return; }
+    await ctx.answerCallbackQuery({ text: `⏳ Surildi` });
     await ctx.editMessageReplyMarkup({ reply_markup: undefined });
     await ctx.reply(`⏳ Muddat <b>${fmtDate(newDue)}</b> ga surildi.`, { parse_mode: "HTML" });
   } catch (err) {
-    console.error("[callback]", err);
-    await ctx.answerCallbackQuery({ text: "Xatolik yuz berdi" });
+    console.error(err);
+    await ctx.answerCallbackQuery({ text: "Xatolik" });
   }
 });
 
 bot.catch((err) => {
-  console.error(`Update ${err.ctx.update.update_id}:`, err.error);
+  console.error(`Update:`, err.error);
 });
 
 // ---------------------------------------------------------------------------
-// Background Cleanup Job (Permanently delete profiles after 1 hour of deletion request)
+// Background Cleanup Job (1 hour soft delete)
 // ---------------------------------------------------------------------------
 setInterval(async () => {
   try {
@@ -654,26 +687,21 @@ setInterval(async () => {
         await db.from("debts").delete().eq("business_id", biz.id);
         await db.from("customers").delete().eq("business_id", biz.id);
         await db.from("businesses").delete().eq("id", biz.id);
-        console.log(`[Cleanup] Permanently deleted business ${biz.id} after 1 hour.`);
       }
     }
-  } catch (err) {
-    console.error("[Cleanup Error]", err);
-  }
-}, 10 * 60 * 1000); // Check every 10 minutes
+  } catch (err) {}
+}, 10 * 60 * 1000);
 
 // ---------------------------------------------------------------------------
 // Daily Cron Job
 // ---------------------------------------------------------------------------
-
 async function sendReminders(): Promise<void> {
-  console.log(`[cron] Sending reminders...`);
   let debts: DueDebt[];
-  try { debts = await fetchDueDebts(); } catch (e) { console.error("[cron]", e); return; }
-  if (!debts.length) { console.log("[cron] No due debts today."); return; }
+  try { debts = await fetchDueDebts(); } catch (e) { return; }
+  if (!debts.length) return;
 
-  let sent = 0, failed = 0;
   for (const debt of debts) {
+    if (!(await isBusinessActive(debt.business_id))) continue; // Skip inactive businesses
     const ownerId = await getOwnerTelegramId(debt.business_id);
     if (!ownerId) continue;
     try {
@@ -681,13 +709,8 @@ async function sendReminders(): Promise<void> {
         parse_mode: "HTML",
         reply_markup: debtKeyboard(debt.id, debt.customers.phone),
       });
-      sent++;
-    } catch (e) {
-      failed++;
-      console.error(`[cron] Failed for debt ${debt.id}:`, e);
-    }
+    } catch (e) {}
   }
-  console.log(`[cron] Completed: ${sent} sent, ${failed} failed.`);
 }
 
 cron.schedule(CRON_SCHED, () => void sendReminders(), { timezone: CRON_TZ });
@@ -705,8 +728,27 @@ app.use(express.json());
 const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`;
 app.use(WEBHOOK_PATH, webhookCallback(bot, "express"));
 
-app.post("/auth/telegram", (req, res) => {
-  res.json({ success: true, message: "Ulanish muvaffaqiyatli" });
+// Secured Telegram Auth API endpoint for WebApp
+app.post("/auth/telegram", async (req, res) => {
+  try {
+    const { telegram_id } = req.body;
+    if (!telegram_id) {
+      return res.status(400).json({ success: false, error: "Telegram ID talab qilinadi" });
+    }
+    const user = await getUser(Number(telegram_id));
+    if (!user) {
+      return res.status(401).json({ success: false, error: "Foydalanuvchi topilmadi" });
+    }
+
+    const active = await isBusinessActive(user.business_id);
+    if (!active) {
+      return res.status(403).json({ success: false, error: "Obuna faol emas" });
+    }
+
+    res.json({ success: true, message: "Ulanish muvaffaqiyatli" });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.get("/", (_req, res) => {
@@ -729,15 +771,11 @@ app.listen(PORT, "0.0.0.0", async () => {
       console.error("Failed to set Telegram Webhook:", err);
     }
   } else {
-    console.log("No RENDER_EXTERNAL_URL found. Falling back to Polling mode...");
     await bot.api.deleteWebhook({ drop_pending_updates: true });
-    void bot.start({
-      onStart: (info) => console.log(`@${info.username} is running in Polling mode`),
-    });
+    void bot.start();
   }
 });
 
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  console.error("[Express Error]:", err);
   res.status(500).json({ success: false, error: err?.message || "Internal Server Error" });
 });
