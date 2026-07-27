@@ -21,11 +21,6 @@ function envInt(k: string, fb: number): number {
   return isFinite(v) ? v : fb;
 }
 
-function safeEq(a: string, b: string): boolean {
-  const la = Buffer.from(a), lb = Buffer.from(b);
-  return la.length === lb.length && timingSafeEqual(la, lb);
-}
-
 const BOT_TOKEN   = getEnv("TELEGRAM_BOT_TOKEN", "BOT_TOKEN");
 const SUPA_URL    = getEnv("SUPABASE_URL");
 const SUPA_KEY    = getEnv("SUPABASE_SERVICE_ROLE_KEY");
@@ -36,7 +31,7 @@ const DEFER_DAYS  = envInt("DEFER_DAYS", 3);
 const RENDER_URL  = process.env.RENDER_EXTERNAL_URL || process.env.SERVER_URL || "";
 
 // ---------------------------------------------------------------------------
-// Supabase Client (Service Role)
+// Supabase Client
 // ---------------------------------------------------------------------------
 
 const db: SupabaseClient = createClient(SUPA_URL, SUPA_KEY, {
@@ -68,15 +63,13 @@ interface DueDebt {
 // ---------------------------------------------------------------------------
 
 async function getUser(telegramId: number): Promise<UserRow | null> {
-  // O'ZGARISH: error o'zgaruvchisi ham olindi va tekshirildi
   const { data, error } = await db
     .from("users")
     .select("telegram_id, business_id, role, full_name")
     .eq("telegram_id", telegramId)
     .maybeSingle();
     
-  if (error) throw new Error(error.message);
-  
+  if (error) throw new Error(`[Supabase getUser] ${error.message}`);
   return data as UserRow | null;
 }
 
@@ -86,14 +79,14 @@ async function registerOwner(telegramId: number, fullName: string): Promise<User
     .insert({ name: fullName, phone: "" })
     .select("id")
     .single();
-  if (bizErr) throw new Error(bizErr.message);
+  if (bizErr) throw new Error(`[Supabase Biz] ${bizErr.message}`);
 
   const { data: user, error: userErr } = await db
     .from("users")
     .insert({ telegram_id: telegramId, business_id: biz.id, role: "owner", full_name: fullName })
     .select("telegram_id, business_id, role, full_name")
     .single();
-  if (userErr) throw new Error(userErr.message);
+  if (userErr) throw new Error(`[Supabase User] ${userErr.message}`);
   return user as UserRow;
 }
 
@@ -160,16 +153,12 @@ async function getOwnerTelegramId(businessId: string): Promise<number | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Formatters & Escaping
+// Formatters
 // ---------------------------------------------------------------------------
 
 function fmt(n: number) { return new Intl.NumberFormat("uz-UZ").format(n); }
 function fmtDate(iso: string) {
   return new Intl.DateTimeFormat("uz-UZ", { timeZone: CRON_TZ, day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(iso));
-}
-
-function esc(t: string) { 
-  return t.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1"); 
 }
 
 function displayName(from: { first_name?: string; last_name?: string; id: number }) {
@@ -180,13 +169,13 @@ function debtMsg(debt: DueDebt): string {
   const today = new Intl.DateTimeFormat("en-CA", { timeZone: CRON_TZ }).format(new Date());
   const overdue = debt.due_date < today;
   return [
-    overdue ? "⚠️ *Muddati o'tgan nasiya*" : "🔔 *Bugun to'lov muddati*",
+    overdue ? "⚠️ <b>Muddati o'tgan nasiya</b>" : "🔔 <b>Bugun to'lov muddati</b>",
     "",
-    `👤 *Mijoz:* ${esc(debt.customers.name)}`,
-    debt.customers.phone ? `📞 *Telefon:* ${esc(debt.customers.phone)}` : null,
-    `💰 *Summa:* ${esc(fmt(debt.amount))} so'm`,
-    debt.note ? `📝 *Izoh:* ${esc(debt.note)}` : null,
-    `📅 *Muddat:* ${esc(fmtDate(debt.due_date))}`,
+    `👤 <b>Mijoz:</b> ${debt.customers.name}`,
+    debt.customers.phone ? `📞 <b>Telefon:</b> ${debt.customers.phone}` : null,
+    `💰 <b>Summa:</b> ${fmt(debt.amount)} so'm`,
+    debt.note ? `📝 <b>Izoh:</b> ${debt.note}` : null,
+    `📅 <b>Muddat:</b> ${fmtDate(debt.due_date)}`,
   ].filter(Boolean).join("\n");
 }
 
@@ -210,19 +199,22 @@ bot.command("start", async (ctx) => {
       user = await registerOwner(ctx.from.id, displayName(ctx.from));
     }
 
+    const roleText = user.role === "owner" ? "Egasi" : "Menejer";
     const trialInfo = user.role === "owner" ? "\n\n🎁 3 kunlik sinov davri faol!" : "";
+    const name = user.full_name ?? "Foydalanuvchi";
 
     await ctx.reply(
-      `Assalomu alaykum, *${esc(user.full_name ?? "Foydalanuvchi")}*!\n\n` +
-      `Siz *${esc(user.role === "owner" ? "Egasi" : "Menejer")}* sifatida kirgansiz.${esc(trialInfo)}`,
+      `Assalomu alaykum, <b>${name}</b>!\n\n` +
+      `Siz <b>${roleText}</b> sifatida kirgansiz.${trialInfo}`,
       {
-        parse_mode: "MarkdownV2",
+        parse_mode: "HTML",
         reply_markup: new InlineKeyboard().webApp("📒 Nasiya Daftarini ochish", WEBAPP_URL),
       }
     );
-  } catch (err) {
+  } catch (err: any) {
     console.error("[/start]", err);
-    await ctx.reply("Xatolik yuz berdi. Keyinroq qayta urinib ko'ring.");
+    const errorMsg = err?.message || String(err);
+    await ctx.reply(`⚠️ Xatolik yuz berdi:\n<code>${errorMsg}</code>`, { parse_mode: "HTML" });
   }
 });
 
@@ -241,15 +233,15 @@ bot.command("stats", async (ctx) => {
     const totalSum = (sumData ?? []).reduce((s: number, r: any) => s + Number(r.amount), 0);
 
     await ctx.reply(
-      `📊 *Statistika*\n\n` +
-      `👥 Mijozlar: *${totalCustomers ?? 0}*\n` +
-      `📋 Ochiq nasiyalar: *${pendingDebts ?? 0}*\n` +
-      `💰 Jami qarz: *${esc(fmt(totalSum))} so'm*`,
-      { parse_mode: "MarkdownV2" }
+      `📊 <b>Statistika</b>\n\n` +
+      `👥 Mijozlar: <b>${totalCustomers ?? 0}</b>\n` +
+      `📋 Ochiq nasiyalar: <b>${pendingDebts ?? 0}</b>\n` +
+      `💰 Jami qarz: <b>${fmt(totalSum)} so'm</b>`,
+      { parse_mode: "HTML" }
     );
-  } catch (err) {
+  } catch (err: any) {
     console.error("[/stats]", err);
-    await ctx.reply("Xatolik yuz berdi.");
+    await ctx.reply(`⚠️ Xatolik: <code>${err?.message || err}</code>`, { parse_mode: "HTML" });
   }
 });
 
@@ -269,7 +261,7 @@ bot.on("callback_query:data", async (ctx) => {
       if (!ok) { await ctx.answerCallbackQuery({ text: "Qarz topilmadi yoki allaqachon yopilgan" }); return; }
       await ctx.answerCallbackQuery({ text: "✅ To'lov qabul qilindi" });
       await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-      await ctx.reply("✅ Nasiya to'langan deb belgilandi\\.", { parse_mode: "MarkdownV2" });
+      await ctx.reply("✅ Nasiya to'langan deb belgilandi.");
       return;
     }
 
@@ -277,7 +269,7 @@ bot.on("callback_query:data", async (ctx) => {
     if (!newDue) { await ctx.answerCallbackQuery({ text: "Qarz topilmadi" }); return; }
     await ctx.answerCallbackQuery({ text: `⏳ ${DEFER_DAYS} kunga surildi` });
     await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-    await ctx.reply(`⏳ Muddat *${esc(fmtDate(newDue))}* ga surildi\\.`, { parse_mode: "MarkdownV2" });
+    await ctx.reply(`⏳ Muddat <b>${fmtDate(newDue)}</b> ga surildi.`, { parse_mode: "HTML" });
   } catch (err) {
     console.error("[callback]", err);
     await ctx.answerCallbackQuery({ text: "Xatolik yuz berdi" });
@@ -306,7 +298,7 @@ async function sendReminders(): Promise<void> {
     if (!ownerId) continue;
     try {
       await bot.api.sendMessage(ownerId, debtMsg(debt), {
-        parse_mode: "MarkdownV2",
+        parse_mode: "HTML",
         reply_markup: debtKeyboard(debt.id, debt.customers.phone),
       });
       sent++;
@@ -321,7 +313,7 @@ async function sendReminders(): Promise<void> {
 cron.schedule(CRON_SCHED, () => void sendReminders(), { timezone: CRON_TZ });
 
 // ---------------------------------------------------------------------------
-// Express Web Server & Webhook Setup
+// Express Web Server Setup
 // ---------------------------------------------------------------------------
 
 const app = express();
@@ -342,9 +334,8 @@ app.use(express.json());
 const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`;
 app.use(WEBHOOK_PATH, webhookCallback(bot, "express"));
 
-// O'ZGARISH: Frontend'dan keladigan so'rovlar uchun marshrut qo'shildi
+// Frontend / Web App uchun Endpoint
 app.post("/auth/telegram", (req, res) => {
-  // Bu yerda frontend dan keladigan so'rovlarni qabul qilasiz
   res.json({ success: true, message: "Ulanish muvaffaqiyatli" });
 });
 
