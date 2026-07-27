@@ -1,8 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { timingSafeEqual } from "node:crypto";
-import { Bot, InlineKeyboard, GrammyError, HttpError, webhookCallback } from "grammy";
+import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import cron from "node-cron";
 
@@ -21,14 +20,15 @@ function envInt(k: string, fb: number): number {
   return isFinite(v) ? v : fb;
 }
 
-const BOT_TOKEN   = getEnv("TELEGRAM_BOT_TOKEN", "BOT_TOKEN");
-const SUPA_URL    = getEnv("SUPABASE_URL");
-const SUPA_KEY    = getEnv("SUPABASE_SERVICE_ROLE_KEY");
-const WEBAPP_URL  = getEnv("WEBAPP_URL");
-const CRON_SCHED  = process.env.CRON_SCHEDULE ?? "0 9 * * *";
-const CRON_TZ     = process.env.CRON_TZ       ?? "Asia/Tashkent";
-const DEFER_DAYS  = envInt("DEFER_DAYS", 3);
-const RENDER_URL  = process.env.RENDER_EXTERNAL_URL || process.env.SERVER_URL || "";
+const BOT_TOKEN       = getEnv("TELEGRAM_BOT_TOKEN", "BOT_TOKEN");
+const SUPA_URL        = getEnv("SUPABASE_URL");
+const SUPA_KEY        = getEnv("SUPABASE_SERVICE_ROLE_KEY");
+const WEBAPP_URL      = getEnv("WEBAPP_URL");
+const CRON_SCHED      = process.env.CRON_SCHEDULE ?? "0 9 * * *";
+const CRON_TZ         = process.env.CRON_TZ       ?? "Asia/Tashkent";
+const DEFER_DAYS      = envInt("DEFER_DAYS", 3);
+const RENDER_URL      = process.env.RENDER_EXTERNAL_URL || process.env.SERVER_URL || "";
+const ADMIN_TELEGRAM_ID = Number(process.env.ADMIN_TELEGRAM_ID || 0);
 
 // ---------------------------------------------------------------------------
 // Supabase Client
@@ -37,6 +37,12 @@ const RENDER_URL  = process.env.RENDER_EXTERNAL_URL || process.env.SERVER_URL ||
 const db: SupabaseClient = createClient(SUPA_URL, SUPA_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
+
+// ---------------------------------------------------------------------------
+// In-Memory States for Support & Feedback
+// ---------------------------------------------------------------------------
+const waitingForSupport = new Set<number>();
+const waitingForFeedback = new Set<number>();
 
 // ---------------------------------------------------------------------------
 // Types & Interfaces
@@ -61,7 +67,7 @@ interface DueDebt {
 }
 
 // ---------------------------------------------------------------------------
-// Database Helpers & Smart Features (1 & 4)
+// Database Helpers & Smart Features
 // ---------------------------------------------------------------------------
 
 async function getUser(telegramId: number): Promise<UserRow | null> {
@@ -157,7 +163,7 @@ async function getOwnerTelegramId(businessId: string): Promise<number | null> {
   return data?.telegram_id ?? null;
 }
 
-// 🟢 1. Mijozning ishonchlilik reytingini hisoblovchi yordamchi funksiya
+// 🟢 1. Mijozning ishonchlilik reytingi
 async function calculateCustomerRating(customerId: string): Promise<string> {
   const { data: debts } = await db
     .from("debts")
@@ -184,7 +190,7 @@ async function calculateCustomerRating(customerId: string): Promise<string> {
   return "🟢 Yaxshi";
 }
 
-// 🟢 4. Qismga bo'lib to'lash (Grafik tuzish) funksiyasi
+// 🟢 4. Qismga bo'lib to'lash (Grafik tuzish)
 async function createInstallmentPlan(debtId: string, totalAmount: number, months: number, firstDueDate: string) {
   const installmentAmount = Math.round(totalAmount / months);
   const schedules = [];
@@ -265,7 +271,8 @@ bot.command("start", async (ctx) => {
         reply_markup: {
           keyboard: [
             [{ text: "📊 Statistika va Hisobotlar" }, { text: "⚙️ Profilni ko'rish" }],
-            [{ text: "📒 Nasiya Daftarini ochish (WebApp)" }]
+            [{ text: "📒 Nasiya Daftarini ochish (WebApp)" }],
+            [{ text: "💬 Adminga murojaat" }, { text: "⭐ Fikr bildirish" }]
           ],
           resize_keyboard: true,
         },
@@ -275,6 +282,96 @@ bot.command("start", async (ctx) => {
     console.error("[/start]", err);
     await ctx.reply(`⚠️ Xatolik yuz berdi:\n<code>${err?.message || err}</code>`, { parse_mode: "HTML" });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Admin Panel Command (/admin)
+// ---------------------------------------------------------------------------
+bot.command("admin", async (ctx) => {
+  if (!ctx.from) return;
+  if (ADMIN_TELEGRAM_ID && ctx.from.id !== ADMIN_TELEGRAM_ID) {
+    await ctx.reply("⛔ Sizda bu buyruqdan foydalanish huquqi yo'q.");
+    return;
+  }
+
+  await ctx.reply(
+    `🛠 <b>Admin Boshqaruv Paneli</b>\n\n` +
+    `Quyidagi tugmalar orqali bot va bizneslar faoliyatini nazorat qilishingiz mumkin:`,
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("📊 Aktivlik va Statistika", "admin:stats").row()
+        .text("📥 Murojaat va Fikrlar", "admin:messages"),
+    }
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Support & Feedback Button Listeners
+// ---------------------------------------------------------------------------
+bot.hears("💬 Adminga murojaat", async (ctx) => {
+  if (!ctx.from) return;
+  waitingForSupport.add(ctx.from.id);
+  waitingForFeedback.delete(ctx.from.id);
+  await ctx.reply("✍️ Adminga yo'llamoqchi bo'lgan murojaatingiz yoki savolingizni yozib yuboring:");
+});
+
+bot.hears("⭐ Fikr bildirish", async (ctx) => {
+  if (!ctx.from) return;
+  waitingForFeedback.add(ctx.from.id);
+  waitingForSupport.delete(ctx.from.id);
+  await ctx.reply("📝 Bot haqida o'z fikringiz, taklifingiz yoki shikoyatingizni yozib qoldiring:");
+});
+
+// Capture text messages for support/feedback
+bot.on("message:text", async (ctx, next) => {
+  if (!ctx.from) return next();
+  const userId = ctx.from.id;
+  const text = ctx.msg.text;
+
+  if (text.startsWith("/")) return next();
+
+  if (waitingForSupport.has(userId)) {
+    waitingForSupport.delete(userId);
+    await db.from("bot_feedback").insert({
+      telegram_id: userId,
+      full_name: displayName(ctx.from),
+      text: text,
+      type: "support"
+    });
+
+    await ctx.reply("✅ Murojaatingiz adminga yuborildi. Tez orada javob beramiz!");
+    if (ADMIN_TELEGRAM_ID) {
+      await bot.api.sendMessage(
+        ADMIN_TELEGRAM_ID,
+        `📬 <b>Yangi Murojaat!</b>\n\n👤 Kimdan: ${displayName(ctx.from)} (<code>${userId}</code>)\n💬 Matn: ${text}`,
+        { parse_mode: "HTML" }
+      );
+    }
+    return;
+  }
+
+  if (waitingForFeedback.has(userId)) {
+    waitingForFeedback.delete(userId);
+    await db.from("bot_feedback").insert({
+      telegram_id: userId,
+      full_name: displayName(ctx.from),
+      text: text,
+      type: "feedback"
+    });
+
+    await ctx.reply("⭐ Fikringiz uchun rahmat! Botni yanada yaxshilashga yordam berganingizdan xursandmiz.");
+    if (ADMIN_TELEGRAM_ID) {
+      await bot.api.sendMessage(
+        ADMIN_TELEGRAM_ID,
+        `⭐ <b>Yangi Fikr-mulohaza!</b>\n\n👤 Kimdan: ${displayName(ctx.from)} (<code>${userId}</code>)\n📝 Matn: ${text}`,
+        { parse_mode: "HTML" }
+      );
+    }
+    return;
+  }
+
+  return next();
 });
 
 bot.hears("📒 Nasiya Daftarini ochish (WebApp)", async (ctx) => {
@@ -356,28 +453,77 @@ bot.hears("📊 Statistika va Hisobotlar", async (ctx) => {
   }
 });
 
-bot.command("stats", async (ctx) => {
-  if (!ctx.from) return;
-  const user = await getUser(ctx.from.id);
-  if (!user) { await ctx.reply("Avval /start bosing."); return; }
-  
-  const { count: totalCustomers } = await db.from("customers").select("*", { count: "exact", head: true }).eq("business_id", user.business_id);
-  const { data: debts } = await db.from("debts").select("amount, paid_amount, status").eq("business_id", user.business_id).eq("status", "pending");
-  
-  const totalSum = (debts ?? []).reduce((s: number, r: any) => s + (Number(r.amount) - Number(r.paid_amount || 0)), 0);
-
-  await ctx.reply(
-    `📊 <b>Tezkor Statistika</b>\n\n` +
-    `👥 Mijozlar: <b>${totalCustomers ?? 0}</b>\n` +
-    `📋 Ochiq nasiyalar soni: <b>${debts?.length ?? 0}</b>\n` +
-    `💰 Jami qoldiq qarz: <b>${fmt(totalSum)} so'm</b>`,
-    { parse_mode: "HTML" }
-  );
-});
-
+// ---------------------------------------------------------------------------
+// Callbacks (Pay, Defer & Admin Actions)
+// ---------------------------------------------------------------------------
 bot.on("callback_query:data", async (ctx) => {
   if (!ctx.from) return;
   const data = ctx.callbackQuery.data;
+
+  // Admin Panel Actions
+  if (data.startsWith("admin:")) {
+    if (ADMIN_TELEGRAM_ID && ctx.from.id !== ADMIN_TELEGRAM_ID) {
+      await ctx.answerCallbackQuery({ text: "Ruxsat yo'q" });
+      return;
+    }
+
+    if (data === "admin:stats") {
+      // Bizneslar aktivligini tekshirish
+      const { data: businesses } = await db.from("businesses").select("id, name, phone, created_at");
+      const { data: allDebts } = await db.from("debts").select("business_id, created_at");
+
+      const totalBiz = businesses?.length || 0;
+      const now = new Date();
+      const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+      let activeCount = 0;
+      let inactiveCount = 0;
+
+      businesses?.forEach((biz: any) => {
+        const bizDebts = allDebts?.filter((d: any) => d.business_id === biz.id) || [];
+        const hasRecentActivity = bizDebts.some((d: any) => new Date(d.created_at) >= sevenDaysAgo);
+        if (hasRecentActivity) {
+          activeCount++;
+        } else {
+          inactiveCount++;
+        }
+      });
+
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(
+        `📊 <b>Tizim Statistikasi va Faollik</b>\n\n` +
+        `🏢 Jami ro'yxatdan o'tgan bizneslar: <b>${totalBiz} ta</b>\n` +
+        `🟢 Faol bizneslar (oxirgi 7 kunda): <b>${activeCount} ta</b>\n` +
+        `🔴 Nofaol / Passiv bizneslar: <b>${inactiveCount} ta</b>`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    if (data === "admin:messages") {
+      const { data: msgs } = await db
+        .from("bot_feedback")
+        .select("full_name, telegram_id, text, type, created_at")
+        .order("created_at", { ascending: false })
+        .limit(5);
+
+      if (!msgs || msgs.length === 0) {
+        await ctx.answerCallbackQuery({ text: "Murojaatlar yo'q" });
+        return;
+      }
+
+      let textReport = "📥 <b>So'nggi Murojaat va Fikrlar:</b>\n\n";
+      msgs.forEach((m: any, idx: number) => {
+        textReport += `${idx + 1}. [<b>${m.type.toUpperCase()}</b>] ${m.full_name} (<code>${m.telegram_id}</code>):\n💬 ${m.text}\n\n`;
+      });
+
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(textReport, { parse_mode: "HTML" });
+      return;
+    }
+  }
+
+  // Debt Actions (Pay / Defer)
   const match = /^(pay|defer):([0-9a-f-]{36})$/.exec(data);
   if (!match) { await ctx.answerCallbackQuery({ text: "Noto'g'ri so'rov" }); return; }
 
