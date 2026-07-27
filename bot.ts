@@ -61,7 +61,7 @@ interface DueDebt {
 }
 
 // ---------------------------------------------------------------------------
-// Database Helpers
+// Database Helpers & Smart Features (1 & 4)
 // ---------------------------------------------------------------------------
 
 async function getUser(telegramId: number): Promise<UserRow | null> {
@@ -109,7 +109,6 @@ async function fetchDueDebts(): Promise<DueDebt[]> {
 }
 
 async function markDebtPaid(debtId: string, businessId: string): Promise<boolean> {
-  // To'liq yopish uchun statusni paid qilamiz va paid_amount ni amount ga tenglaymiz (agar ustun mavjud bo'lsa)
   const { data: debt } = await db.from("debts").select("amount").eq("id", debtId).single();
   if (!debt) return false;
 
@@ -158,6 +157,55 @@ async function getOwnerTelegramId(businessId: string): Promise<number | null> {
   return data?.telegram_id ?? null;
 }
 
+// 🟢 1. Mijozning ishonchlilik reytingini hisoblovchi yordamchi funksiya
+async function calculateCustomerRating(customerId: string): Promise<string> {
+  const { data: debts } = await db
+    .from("debts")
+    .select("status, due_date, updated_at")
+    .eq("customer_id", customerId);
+
+  if (!debts || debts.length === 0) return "🟢 Yaxshi";
+
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: CRON_TZ }).format(new Date());
+  let overdueCount = 0;
+  let unpaidOverdue = 0;
+
+  debts.forEach((d: any) => {
+    if (d.status === "pending" && d.due_date < today) {
+      unpaidOverdue++;
+    }
+    if (d.status === "paid" && d.updated_at && d.updated_at.slice(0, 10) > d.due_date) {
+      overdueCount++;
+    }
+  });
+
+  if (unpaidOverdue > 0) return "🔴 Xavfli";
+  if (overdueCount > 1) return "🟡 Kechiktiruvchi";
+  return "🟢 Yaxshi";
+}
+
+// 🟢 4. Qismga bo'lib to'lash (Grafik tuzish) funksiyasi
+async function createInstallmentPlan(debtId: string, totalAmount: number, months: number, firstDueDate: string) {
+  const installmentAmount = Math.round(totalAmount / months);
+  const schedules = [];
+  let baseDate = new Date(firstDueDate);
+
+  for (let i = 0; i < months; i++) {
+    const dueDateStr = baseDate.toISOString().slice(0, 10);
+    schedules.push({
+      debt_id: debtId,
+      amount: i === months - 1 ? totalAmount - (installmentAmount * (months - 1)) : installmentAmount,
+      due_date: dueDateStr,
+      status: 'pending'
+    });
+    baseDate.setMonth(baseDate.getMonth() + 1);
+  }
+
+  const { error } = await db.from("debt_schedules").insert(schedules);
+  if (error) throw new Error(`Grafik tuzishda xatolik: ${error.message}`);
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Formatters
 // ---------------------------------------------------------------------------
@@ -192,17 +240,6 @@ function debtKeyboard(debtId: string, phone: string | null): InlineKeyboard {
   return kb.text("✅ Pulni oldim", `pay:${debtId}`).text(`⏳ ${DEFER_DAYS}k surish`, `defer:${debtId}`);
 }
 
-// Asosiy klaviatura (Reply Keyboard)
-const mainKeyboard = {
-  reply_markup: {
-    keyboard: [
-      [{ text: "📊 Statistika va Hisobotlar" }, { text: "⚙️ Profilni ko'rish" }],
-      [{ text: "📒 Nasiya Daftarini ochish (WebApp)" }]
-    ],
-    resize_keyboard: true,
-  },
-};
-
 // ---------------------------------------------------------------------------
 // Bot Handlers
 // ---------------------------------------------------------------------------
@@ -222,37 +259,36 @@ bot.command("start", async (ctx) => {
 
     await ctx.reply(
       `Assalomu alaykum, <b>${name}</b>!\n\n` +
-      `Siz <b>${roleText}</b> sifatida kirgansiz. Quyidagi menyu orqali statistikani ko'rishingiz, profilingizni boshqarishingiz yoki WebApp'ni ochishingiz mumkin.`,
+      `Siz <b>${roleText}</b> sifatida kirgansiz. Quyidagi menyu orqali boshqarishingiz mumkin.`,
       {
         parse_mode: "HTML",
-        ...mainKeyboard,
+        reply_markup: {
+          keyboard: [
+            [{ text: "📊 Statistika va Hisobotlar" }, { text: "⚙️ Profilni ko'rish" }],
+            [{ text: "📒 Nasiya Daftarini ochish (WebApp)" }]
+          ],
+          resize_keyboard: true,
+        },
       }
     );
   } catch (err: any) {
     console.error("[/start]", err);
-    const errorMsg = err?.message || String(err);
-    await ctx.reply(`⚠️ Xatolik yuz berdi:\n<code>${errorMsg}</code>`, { parse_mode: "HTML" });
+    await ctx.reply(`⚠️ Xatolik yuz berdi:\n<code>${err?.message || err}</code>`, { parse_mode: "HTML" });
   }
 });
 
-// WebApp ochish tugmasi uchun text handler
 bot.hears("📒 Nasiya Daftarini ochish (WebApp)", async (ctx) => {
   await ctx.reply("Quyidagi tugma orqali ilovani oching:", {
     reply_markup: new InlineKeyboard().webApp("🚀 WebApp-ni ochish", WEBAPP_URL),
   });
 });
 
-// Profilni ko'rish handler
 bot.hears("⚙️ Profilni ko'rish", async (ctx) => {
   if (!ctx.from) return;
   try {
     const user = await getUser(ctx.from.id);
-    if (!user) {
-      await ctx.reply("Avval /start bosing.");
-      return;
-    }
+    if (!user) { await ctx.reply("Avval /start bosing."); return; }
 
-    // Biznes nomini ham bazadan olib kelamiz
     const { data: biz } = await db.from("businesses").select("name, phone").eq("id", user.business_id).maybeSingle();
 
     await ctx.reply(
@@ -260,8 +296,7 @@ bot.hears("⚙️ Profilni ko'rish", async (ctx) => {
       `👤 Ism: <b>${user.full_name || 'Ko\'rsatilmagan'}</b>\n` +
       `🏢 Do'kon/Biznes: <b>${biz?.name || 'Noma\'lum'}</b>\n` +
       `💼 Rol: <b>${user.role === 'owner' ? 'Rahbar (Owner)' : 'Menejer'}</b>\n` +
-      `🆔 Biznes ID: <code>${user.business_id}</code>\n\n` +
-      `<i>Ma'lumotlarni o'zgartirish uchun WebApp'dan foydalaning.</i>`,
+      `🆔 Biznes ID: <code>${user.business_id}</code>`,
       { parse_mode: "HTML" }
     );
   } catch (err: any) {
@@ -270,7 +305,6 @@ bot.hears("⚙️ Profilni ko'rish", async (ctx) => {
   }
 });
 
-// 1 haftalik, 1 oylik va umumiy statistika
 bot.hears("📊 Statistika va Hisobotlar", async (ctx) => {
   if (!ctx.from) return;
   try {
@@ -296,8 +330,6 @@ bot.hears("📊 Statistika va Hisobotlar", async (ctx) => {
 
     debts.forEach((d: any) => {
       const remaining = (d.amount || 0) - (d.paid_amount || 0);
-      
-      // Agar ochiq nasiya bo'lsa umumiy qarzga qo'shamiz
       if (d.status === 'pending') {
         totalDebt += remaining;
       }
@@ -324,10 +356,8 @@ bot.hears("📊 Statistika va Hisobotlar", async (ctx) => {
   }
 });
 
-// Eski /stats komandasi uchun ham moslashtirib qo'yamiz
 bot.command("stats", async (ctx) => {
   if (!ctx.from) return;
-  // Yuqoridagi statistika mantig'ini chaqiramiz yoki qisqacha chiqazamiz
   const user = await getUser(ctx.from.id);
   if (!user) { await ctx.reply("Avval /start bosing."); return; }
   
@@ -337,7 +367,7 @@ bot.command("stats", async (ctx) => {
   const totalSum = (debts ?? []).reduce((s: number, r: any) => s + (Number(r.amount) - Number(r.paid_amount || 0)), 0);
 
   await ctx.reply(
-    `📊 <b>Tekor Statistika</b>\n\n` +
+    `📊 <b>Tezkor Statistika</b>\n\n` +
     `👥 Mijozlar: <b>${totalCustomers ?? 0}</b>\n` +
     `📋 Ochiq nasiyalar soni: <b>${debts?.length ?? 0}</b>\n` +
     `💰 Jami qoldiq qarz: <b>${fmt(totalSum)} so'm</b>`,
@@ -378,8 +408,6 @@ bot.on("callback_query:data", async (ctx) => {
 
 bot.catch((err) => {
   console.error(`Update ${err.ctx.update.update_id}:`, err.error);
-  if (err.error instanceof GrammyError) console.error("Telegram Error:", err.error.description);
-  else if (err.error instanceof HttpError) console.error("Network Error:", err.error.message);
 });
 
 // ---------------------------------------------------------------------------
@@ -422,11 +450,9 @@ const PORT = Number(process.env.PORT) || 10000;
 app.use(cors());
 app.use(express.json());
 
-// Telegram Webhook Marshruti
 const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`;
 app.use(WEBHOOK_PATH, webhookCallback(bot, "express"));
 
-// Frontend / Web App uchun Endpoint
 app.post("/auth/telegram", (req, res) => {
   res.json({ success: true, message: "Ulanish muvaffaqiyatli" });
 });
@@ -435,11 +461,9 @@ app.get("/", (_req, res) => {
   res.send("Nasiya Daftari API & Bot is running.");
 });
 
-// Graceful Shutdown
 process.once("SIGINT", () => bot.stop());
 process.once("SIGTERM", () => bot.stop());
 
-// Express Serverni Ishga Tushirish
 app.listen(PORT, "0.0.0.0", async () => {
   console.log(`HTTP Server running on port ${PORT}`);
 
@@ -461,16 +485,7 @@ app.listen(PORT, "0.0.0.0", async () => {
   }
 });
 
-// Express xatolarini ushlash uchun middleware
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error("[Express Error]:", err);
   res.status(500).json({ success: false, error: err?.message || "Internal Server Error" });
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("[Uncaught Exception]:", err);
-});
-
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("[Unhandled Rejection]:", reason);
 });
