@@ -619,11 +619,11 @@ try {
   if (!error.description?.includes("message is not modified")) {
     throw error;
   }
-  await ctx.answerCallbackQuery({
-    text: "Bu biznes allaqachon faollashtirilgan!",
-  });
-}
-
+        await ctx.answerCallbackQuery({
+          text: "Bu biznes allaqachon faollashtirilgan!",
+        });
+      }
+    }
     if (data === "admin:stats") {
       const { data: businesses } = await db.from("businesses").select("id, name, is_active");
       const totalBiz = businesses?.length || 0;
