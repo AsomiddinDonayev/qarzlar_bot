@@ -608,15 +608,21 @@ bot.on("callback_query:data", async (ctx) => {
 
       const ownerId = await getOwnerTelegramId(bizId);
       if (ownerId) {
-        try {
-          await bot.api.sendMessage(ownerId, "🎉 <b>Tabriklaymiz!</b> Obunangiz admin tomonidan tasdiqlandi. Endi bot va ilovadan to'liq foydalanishingiz mumkin! /start bosing.", { parse_mode: "HTML" });
-        } catch (e) {}
-      }
-
-      await ctx.answerCallbackQuery({ text: "Biznes faollashtirildi!" });
-      await ctx.editMessageText(`✅ Biznes muvaffaqiyatli faollashtirildi!`);
-      return;
-    }
+       // YANGI KOD:
+try {
+  await ctx.editMessageText("✅ Biznes muvaffaqiyatli faollashtirildi!");
+  await ctx.answerCallbackQuery({
+    text: "Muvaffaqiyatli bajarildi!",
+  });
+} catch (error: any) {
+  // Agar xatolik faqat "message is not modified" bo'lsa, uni e'tiborsiz qoldiramiz
+  if (!error.description?.includes("message is not modified")) {
+    throw error;
+  }
+  await ctx.answerCallbackQuery({
+    text: "Bu biznes allaqachon faollashtirilgan!",
+  });
+}
 
     if (data === "admin:stats") {
       const { data: businesses } = await db.from("businesses").select("id, name, is_active");
