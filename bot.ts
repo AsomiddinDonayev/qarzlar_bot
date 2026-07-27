@@ -360,3 +360,18 @@ app.listen(PORT, "0.0.0.0", async () => {
     });
   }
 });
+
+// Express xatolarini ushlash uchun middleware (app.listen'dan tepada tursin)
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error("[Express Error]:", err);
+  res.status(500).json({ success: false, error: err?.message || "Internal Server Error" });
+});
+
+// Node.js process o'chib ketishining oldini olish (Eng oxiriga qo'yiladi)
+process.on("uncaughtException", (err) => {
+  console.error("[Uncaught Exception]:", err);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[Unhandled Rejection]:", reason);
+});
