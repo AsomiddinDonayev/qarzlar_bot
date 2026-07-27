@@ -52,8 +52,10 @@ interface UserRow {
 interface DueDebt {
   id: string;
   amount: number;
+  paid_amount?: number;
   note: string | null;
   due_date: string;
+  created_at?: string;
   business_id: string;
   customers: { name: string; phone: string | null };
 }
@@ -96,7 +98,7 @@ async function fetchDueDebts(): Promise<DueDebt[]> {
   const { data, error } = await db
     .from("debts")
     .select(`
-      id, amount, note, due_date, business_id,
+      id, amount, paid_amount, note, due_date, created_at, business_id,
       customers!inner(name, phone)
     `)
     .eq("status", "pending")
@@ -107,9 +109,13 @@ async function fetchDueDebts(): Promise<DueDebt[]> {
 }
 
 async function markDebtPaid(debtId: string, businessId: string): Promise<boolean> {
+  // To'liq yopish uchun statusni paid qilamiz va paid_amount ni amount ga tenglaymiz (agar ustun mavjud bo'lsa)
+  const { data: debt } = await db.from("debts").select("amount").eq("id", debtId).single();
+  if (!debt) return false;
+
   const { data } = await db
     .from("debts")
-    .update({ status: "paid" })
+    .update({ status: "paid", paid_amount: debt.amount })
     .eq("id", debtId)
     .eq("business_id", businessId)
     .eq("status", "pending")
@@ -168,12 +174,13 @@ function displayName(from: { first_name?: string; last_name?: string; id: number
 function debtMsg(debt: DueDebt): string {
   const today = new Intl.DateTimeFormat("en-CA", { timeZone: CRON_TZ }).format(new Date());
   const overdue = debt.due_date < today;
+  const remaining = (debt.amount || 0) - (debt.paid_amount || 0);
   return [
     overdue ? "⚠️ <b>Muddati o'tgan nasiya</b>" : "🔔 <b>Bugun to'lov muddati</b>",
     "",
     `👤 <b>Mijoz:</b> ${debt.customers.name}`,
     debt.customers.phone ? `📞 <b>Telefon:</b> ${debt.customers.phone}` : null,
-    `💰 <b>Summa:</b> ${fmt(debt.amount)} so'm`,
+    `💰 <b>Qoldiq summa:</b> ${fmt(remaining)} so'm`,
     debt.note ? `📝 <b>Izoh:</b> ${debt.note}` : null,
     `📅 <b>Muddat:</b> ${fmtDate(debt.due_date)}`,
   ].filter(Boolean).join("\n");
@@ -184,6 +191,17 @@ function debtKeyboard(debtId: string, phone: string | null): InlineKeyboard {
   if (phone) kb.url("📞 Qo'ng'iroq", `tel:${phone.replace(/\D/g, "").replace(/^998/, "+998")}`).row();
   return kb.text("✅ Pulni oldim", `pay:${debtId}`).text(`⏳ ${DEFER_DAYS}k surish`, `defer:${debtId}`);
 }
+
+// Asosiy klaviatura (Reply Keyboard)
+const mainKeyboard = {
+  reply_markup: {
+    keyboard: [
+      [{ text: "📊 Statistika va Hisobotlar" }, { text: "⚙️ Profilni ko'rish" }],
+      [{ text: "📒 Nasiya Daftarini ochish (WebApp)" }]
+    ],
+    resize_keyboard: true,
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Bot Handlers
@@ -200,15 +218,14 @@ bot.command("start", async (ctx) => {
     }
 
     const roleText = user.role === "owner" ? "Egasi" : "Menejer";
-    const trialInfo = user.role === "owner" ? "\n\n🎁 3 kunlik sinov davri faol!" : "";
     const name = user.full_name ?? "Foydalanuvchi";
 
     await ctx.reply(
       `Assalomu alaykum, <b>${name}</b>!\n\n` +
-      `Siz <b>${roleText}</b> sifatida kirgansiz.${trialInfo}`,
+      `Siz <b>${roleText}</b> sifatida kirgansiz. Quyidagi menyu orqali statistikani ko'rishingiz, profilingizni boshqarishingiz yoki WebApp'ni ochishingiz mumkin.`,
       {
         parse_mode: "HTML",
-        reply_markup: new InlineKeyboard().webApp("📒 Nasiya Daftarini ochish", WEBAPP_URL),
+        ...mainKeyboard,
       }
     );
   } catch (err: any) {
@@ -218,31 +235,114 @@ bot.command("start", async (ctx) => {
   }
 });
 
-bot.command("stats", async (ctx) => {
+// WebApp ochish tugmasi uchun text handler
+bot.hears("📒 Nasiya Daftarini ochish (WebApp)", async (ctx) => {
+  await ctx.reply("Quyidagi tugma orqali ilovani oching:", {
+    reply_markup: new InlineKeyboard().webApp("🚀 WebApp-ni ochish", WEBAPP_URL),
+  });
+});
+
+// Profilni ko'rish handler
+bot.hears("⚙️ Profilni ko'rish", async (ctx) => {
+  if (!ctx.from) return;
+  try {
+    const user = await getUser(ctx.from.id);
+    if (!user) {
+      await ctx.reply("Avval /start bosing.");
+      return;
+    }
+
+    // Biznes nomini ham bazadan olib kelamiz
+    const { data: biz } = await db.from("businesses").select("name, phone").eq("id", user.business_id).maybeSingle();
+
+    await ctx.reply(
+      `⚙️ <b>SizningProfilingiz:</b>\n\n` +
+      `👤 Ism: <b>${user.full_name || 'Ko\'rsatilmagan'}</b>\n` +
+      `🏢 Do'kon/Biznes: <b>${biz?.name || 'Noma\'lum'}</b>\n` +
+      `💼 Rol: <b>${user.role === 'owner' ? 'Rahbar (Owner)' : 'Menejer'}</b>\n` +
+      `🆔 Biznes ID: <code>${user.business_id}</code>\n\n` +
+      `<i>Ma'lumotlarni o'zgartirish uchun WebApp'dan foydalaning.</i>`,
+      { parse_mode: "HTML" }
+    );
+  } catch (err: any) {
+    console.error("[Profile]", err);
+    await ctx.reply("Profilni yuklashda xatolik yuz berdi.");
+  }
+});
+
+// 1 haftalik, 1 oylik va umumiy statistika
+bot.hears("📊 Statistika va Hisobotlar", async (ctx) => {
   if (!ctx.from) return;
   try {
     const user = await getUser(ctx.from.id);
     if (!user) { await ctx.reply("Avval /start bosing."); return; }
 
-    const [{ count: totalCustomers }, { count: pendingDebts }, { data: sumData }] = await Promise.all([
-      db.from("customers").select("*", { count: "exact", head: true }).eq("business_id", user.business_id),
-      db.from("debts").select("*", { count: "exact", head: true }).eq("business_id", user.business_id).eq("status", "pending"),
-      db.from("debts").select("amount").eq("business_id", user.business_id).eq("status", "pending"),
-    ]);
+    const { data: debts, error } = await db
+      .from("debts")
+      .select("amount, paid_amount, created_at, due_date, status")
+      .eq("business_id", user.business_id);
 
-    const totalSum = (sumData ?? []).reduce((s: number, r: any) => s + Number(r.amount), 0);
+    if (error || !debts) {
+      return ctx.reply("Statistikani olishda xatolik yuz berdi.");
+    }
+
+    const now = new Date();
+    const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const oneMonthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+    let totalDebt = 0;
+    let weekDebt = 0;
+    let monthDebt = 0;
+
+    debts.forEach((d: any) => {
+      const remaining = (d.amount || 0) - (d.paid_amount || 0);
+      
+      // Agar ochiq nasiya bo'lsa umumiy qarzga qo'shamiz
+      if (d.status === 'pending') {
+        totalDebt += remaining;
+      }
+
+      const createdAt = new Date(d.created_at || d.due_date);
+      if (createdAt >= oneWeekAgo) {
+        weekDebt += (d.amount || 0);
+      }
+      if (createdAt >= oneMonthAgo) {
+        monthDebt += (d.amount || 0);
+      }
+    });
 
     await ctx.reply(
-      `📊 <b>Statistika</b>\n\n` +
-      `👥 Mijozlar: <b>${totalCustomers ?? 0}</b>\n` +
-      `📋 Ochiq nasiyalar: <b>${pendingDebts ?? 0}</b>\n` +
-      `💰 Jami qarz: <b>${fmt(totalSum)} so'm</b>`,
+      `📊 <b>Nasiya Statistikasi va Hisobotlar</b>\n\n` +
+      `• 📅 <b>So'nggi 1 haftadagi yangi nasiyalar:</b> ${fmt(weekDebt)} so'm\n` +
+      `• 🗓 <b>So'nggi 1 oydagi yangi nasiyalar:</b> ${fmt(monthDebt)} so'm\n` +
+      `• 💰 <b>Hozirgi umumiy qoldiq qarz:</b> ${fmt(totalDebt)} so'm`,
       { parse_mode: "HTML" }
     );
   } catch (err: any) {
-    console.error("[/stats]", err);
+    console.error("[Stats]", err);
     await ctx.reply(`⚠️ Xatolik: <code>${err?.message || err}</code>`, { parse_mode: "HTML" });
   }
+});
+
+// Eski /stats komandasi uchun ham moslashtirib qo'yamiz
+bot.command("stats", async (ctx) => {
+  if (!ctx.from) return;
+  // Yuqoridagi statistika mantig'ini chaqiramiz yoki qisqacha chiqazamiz
+  const user = await getUser(ctx.from.id);
+  if (!user) { await ctx.reply("Avval /start bosing."); return; }
+  
+  const { count: totalCustomers } = await db.from("customers").select("*", { count: "exact", head: true }).eq("business_id", user.business_id);
+  const { data: debts } = await db.from("debts").select("amount, paid_amount, status").eq("business_id", user.business_id).eq("status", "pending");
+  
+  const totalSum = (debts ?? []).reduce((s: number, r: any) => s + (Number(r.amount) - Number(r.paid_amount || 0)), 0);
+
+  await ctx.reply(
+    `📊 <b>Tekor Statistika</b>\n\n` +
+    `👥 Mijozlar: <b>${totalCustomers ?? 0}</b>\n` +
+    `📋 Ochiq nasiyalar soni: <b>${debts?.length ?? 0}</b>\n` +
+    `💰 Jami qoldiq qarz: <b>${fmt(totalSum)} so'm</b>`,
+    { parse_mode: "HTML" }
+  );
 });
 
 bot.on("callback_query:data", async (ctx) => {
@@ -319,7 +419,7 @@ cron.schedule(CRON_SCHED, () => void sendReminders(), { timezone: CRON_TZ });
 const app = express();
 const PORT = Number(process.env.PORT) || 10000;
 
-app.use(cors()); // Barcha domen va header'larga to'liq ruxsat berish
+app.use(cors());
 app.use(express.json());
 
 // Telegram Webhook Marshruti
@@ -361,13 +461,12 @@ app.listen(PORT, "0.0.0.0", async () => {
   }
 });
 
-// Express xatolarini ushlash uchun middleware (app.listen'dan tepada tursin)
+// Express xatolarini ushlash uchun middleware
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error("[Express Error]:", err);
   res.status(500).json({ success: false, error: err?.message || "Internal Server Error" });
 });
 
-// Node.js process o'chib ketishining oldini olish (Eng oxiriga qo'yiladi)
 process.on("uncaughtException", (err) => {
   console.error("[Uncaught Exception]:", err);
 });
