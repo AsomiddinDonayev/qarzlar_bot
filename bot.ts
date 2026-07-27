@@ -39,9 +39,10 @@ const db: SupabaseClient = createClient(SUPA_URL, SUPA_KEY, {
 });
 
 // ---------------------------------------------------------------------------
-// In-Memory States for Taklif / Shikoyat / Izoh
+// In-Memory States
 // ---------------------------------------------------------------------------
 const userFeedbackType = new Map<number, string>();
+const adminWaitingForBroadcast = new Set<number>();
 
 // ---------------------------------------------------------------------------
 // Types & Interfaces
@@ -208,6 +209,12 @@ bot.command("start", async (ctx) => {
     let user = await getUser(ctx.from.id);
     if (!user) {
       user = await registerOwner(ctx.from.id, displayName(ctx.from));
+    } else {
+      // Check if business is deleted
+      const { data: biz } = await db.from("businesses").select("deleted_at").eq("id", user.business_id).maybeSingle();
+      if (biz?.deleted_at) {
+        await db.from("businesses").update({ deleted_at: null }).eq("id", user.business_id);
+      }
     }
 
     const roleText = user.role === "owner" ? "Egasi" : "Menejer";
@@ -251,7 +258,8 @@ bot.command("admin", async (ctx) => {
       parse_mode: "HTML",
       reply_markup: new InlineKeyboard()
         .text("📊 Aktivlik va Statistika", "admin:stats").row()
-        .text("📥 Murojaat va Fikrlar", "admin:messages"),
+        .text("📥 Murojaat va Fikrlar", "admin:messages").row()
+        .text("📢 Hammaga xabar yuborish", "admin:broadcast"),
     }
   );
 });
@@ -269,7 +277,7 @@ bot.hears("💬 Taklif va Shikoyatlar", async (ctx) => {
   });
 });
 
-// Capture text messages when user is typing their feedback/complaint
+// Capture text messages for feedback or admin broadcast
 bot.on("message:text", async (ctx, next) => {
   if (!ctx.from) return next();
   const userId = ctx.from.id;
@@ -277,6 +285,30 @@ bot.on("message:text", async (ctx, next) => {
 
   if (text.startsWith("/")) return next();
 
+  // Admin Broadcast text capture
+  if (ADMIN_TELEGRAM_ID && userId === ADMIN_TELEGRAM_ID && adminWaitingForBroadcast.has(userId)) {
+    adminWaitingForBroadcast.delete(userId);
+    const { data: allUsers } = await db.from("users").select("telegram_id");
+    const uniqueIds = Array.from(new Set(allUsers?.map((u: any) => u.telegram_id) || []));
+
+    let success = 0;
+    let failed = 0;
+    await ctx.reply(`📢 Xabar yuborish boshlandi (${uniqueIds.length} ta foydalanuvchi)...`);
+
+    for (const tid of uniqueIds) {
+      try {
+        await bot.api.sendMessage(tid, `📢 <b>Admin e'loni:</b>\n\n${text}`, { parse_mode: "HTML" });
+        success++;
+      } catch (e) {
+        failed++;
+      }
+    }
+
+    await ctx.reply(`✅ Xabar tarqatish yakunlandi!\n• Muvaffaqiyatli: ${success} ta\n• Xatolik (bloklaganlar): ${failed} ta`);
+    return;
+  }
+
+  // User feedback capture
   if (userFeedbackType.has(userId)) {
     const type = userFeedbackType.get(userId)!;
     userFeedbackType.delete(userId);
@@ -294,7 +326,7 @@ bot.on("message:text", async (ctx, next) => {
       izoh: "Izohingiz"
     };
 
-    await ctx.reply(`✅ ${typeNames[type] || "Murojaatingiz"} muvaffaqiyatli qabul qilindi! Rahmad.`);
+    await ctx.reply(`✅ ${typeNames[type] || "Murojaatingiz"} muvaffaqiyatli qabul qilindi! Rahmat.`);
 
     if (ADMIN_TELEGRAM_ID) {
       const typeEmoji: Record<string, string> = { shikoyat: "⚠️", taklif: "💡", izoh: "💬" };
@@ -324,15 +356,25 @@ bot.hears("⚙️ Profilni ko'rish", async (ctx) => {
     const user = await getUser(ctx.from.id);
     if (!user) { await ctx.reply("Avval /start bosing."); return; }
 
-    const { data: biz } = await db.from("businesses").select("name, phone").eq("id", user.business_id).maybeSingle();
+    const { data: biz } = await db.from("businesses").select("name, phone, deleted_at").eq("id", user.business_id).maybeSingle();
+    
+    if (biz?.deleted_at) {
+      await ctx.reply("⚠️ Sizning profilingiz o'chirish jarayonida. 1 soat ichida ortga qaytarishingiz mumkin.", {
+        reply_markup: new InlineKeyboard().text("🔄 Profilni tiklash (Undo)", "profile:undo")
+      });
+      return;
+    }
 
     await ctx.reply(
-      `⚙️ <b>SizningProfilingiz:</b>\n\n` +
+      `⚙️ <b>Sizning Profilingiz:</b>\n\n` +
       `👤 Ism: <b>${user.full_name || 'Ko\'rsatilmagan'}</b>\n` +
       `🏢 Do'kon/Biznes: <b>${biz?.name || 'Noma\'lum'}</b>\n` +
       `💼 Rol: <b>${user.role === 'owner' ? 'Rahbar (Owner)' : 'Menejer'}</b>\n` +
       `🆔 Biznes ID: <code>${user.business_id}</code>`,
-      { parse_mode: "HTML" }
+      {
+        parse_mode: "HTML",
+        reply_markup: new InlineKeyboard().text("🗑 Profilni o'chirish", "profile:delete_prompt"),
+      }
     );
   } catch (err: any) {
     console.error("[Profile]", err);
@@ -392,11 +434,82 @@ bot.hears("📊 Statistika va Hisobotlar", async (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// Callbacks (Feedback types, Pay, Defer & Admin Actions)
+// Callbacks (Feedback, Admin Actions, Profile Deletion & Undo)
 // ---------------------------------------------------------------------------
 bot.on("callback_query:data", async (ctx) => {
   if (!ctx.from) return;
   const data = ctx.callbackQuery.data;
+
+  // Profile Deletion Flow
+  if (data === "profile:delete_prompt") {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `⚠️ <b>Diqqat! Profilni o'chirish</b>\n\n` +
+      `Haqiqatan ham profilingiz va barcha ma'lumotlaringizni o'chirmoqchimisiz? ` +
+      `Bu amalni bajarishingiz bilan profil o'chirish jarayoniga qo'yiladi va uni <b>1 soat ichida</b> ortga qaytarish (undo) imkoningiz bo'ladi. ` +
+      `1 soatdan keyin barcha ma'lumotlar bazadan butunlay o'chib ketadi.`,
+      {
+        parse_mode: "HTML",
+        reply_markup: new InlineKeyboard()
+          .text("❌ Ha, o'chirish", "profile:delete_confirm")
+          .text("🔙 Bekor qilish", "profile:cancel")
+      }
+    );
+    return;
+  }
+
+  if (data === "profile:delete_confirm") {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `🔴 <b>Oxirgi tasdiqlash!</b>\n\n` +
+      `Siz rostdan ham barcha ma'lumotlaringizni o'chirib yubormoqchimisiz? ` +
+      `"Tasdiqlash" tugmasini bosganingizdan so'ng 1 soatlik qaytarish vaqti boshlanadi.`,
+      {
+        parse_mode: "HTML",
+        reply_markup: new InlineKeyboard()
+          .text("🔴 Tasdiqlash va o'chirish", "profile:delete_final")
+          .text("🔙 Bekor qilish", "profile:cancel")
+      }
+    );
+    return;
+  }
+
+  if (data === "profile:cancel") {
+    await ctx.answerCallbackQuery({ text: "Bekor qilindi" });
+    await ctx.editMessageText("✅ Amal bekor qilindi.");
+    return;
+  }
+
+  if (data === "profile:delete_final") {
+    const user = await getUser(ctx.from.id);
+    if (!user) { await ctx.answerCallbackQuery({ text: "Foydalanuvchi topilmadi" }); return; }
+
+    const nowIso = new Date().toISOString();
+    await db.from("businesses").update({ deleted_at: nowIso }).eq("id", user.business_id);
+
+    await ctx.answerCallbackQuery({ text: "Profil o'chirishga qo'yildi" });
+    await ctx.editMessageText(
+      `⚠️ <b>Profil o'chirishga belgilandi!</b>\n\n` +
+      `Sizning profilingiz va biznesingiz o'chirish jarayoniga kiritildi. ` +
+      `Agar fikringiz o'zgatsa, keyingi <b>1 soat ichida</b> pastdagi tugmani bosib uni tiklab qolishingiz mumkin.\n\n` +
+      `Aks holda, vaqt tugagach bazadan butunlay o'chib ketadi.`,
+      {
+        parse_mode: "HTML",
+        reply_markup: new InlineKeyboard().text("🔄 Profilni tiklash (Undo)", "profile:undo")
+      }
+    );
+    return;
+  }
+
+  if (data === "profile:undo") {
+    const user = await getUser(ctx.from.id);
+    if (!user) { await ctx.answerCallbackQuery({ text: "Foydalanuvchi topilmadi" }); return; }
+
+    await db.from("businesses").update({ deleted_at: null }).eq("id", user.business_id);
+    await ctx.answerCallbackQuery({ text: "Profil muvaffaqiyatli tiklandi!" });
+    await ctx.editMessageText("✅ Profilingiz muvaffaqiyatli tiklandi va yana faol holatga o'tdi!");
+    return;
+  }
 
   // Feedback Type Selection
   if (data.startsWith("fb_type:")) {
@@ -421,6 +534,17 @@ bot.on("callback_query:data", async (ctx) => {
   if (data.startsWith("admin:")) {
     if (ADMIN_TELEGRAM_ID && ctx.from.id !== ADMIN_TELEGRAM_ID) {
       await ctx.answerCallbackQuery({ text: "Ruxsat yo'q" });
+      return;
+    }
+
+    if (data === "admin:broadcast") {
+      adminWaitingForBroadcast.add(ctx.from.id);
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(
+        `📢 <b>Ommaviy xabar yuborish</b>\n\n` +
+        `Barcha bot foydalanuvchilariga yubormoqchi bo'lgan xabaringizni (matn, rasm matni va hokazo) shu chatga yozib yuboring:`,
+        { parse_mode: "HTML" }
+      );
       return;
     }
 
@@ -511,6 +635,32 @@ bot.on("callback_query:data", async (ctx) => {
 bot.catch((err) => {
   console.error(`Update ${err.ctx.update.update_id}:`, err.error);
 });
+
+// ---------------------------------------------------------------------------
+// Background Cleanup Job (Permanently delete profiles after 1 hour of deletion request)
+// ---------------------------------------------------------------------------
+setInterval(async () => {
+  try {
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const { data: expiredBiz } = await db
+      .from("businesses")
+      .select("id")
+      .not("deleted_at", "is", null)
+      .lt("deleted_at", oneHourAgo);
+
+    if (expiredBiz && expiredBiz.length > 0) {
+      for (const biz of expiredBiz) {
+        await db.from("users").delete().eq("business_id", biz.id);
+        await db.from("debts").delete().eq("business_id", biz.id);
+        await db.from("customers").delete().eq("business_id", biz.id);
+        await db.from("businesses").delete().eq("id", biz.id);
+        console.log(`[Cleanup] Permanently deleted business ${biz.id} after 1 hour.`);
+      }
+    }
+  } catch (err) {
+    console.error("[Cleanup Error]", err);
+  }
+}, 10 * 60 * 1000); // Check every 10 minutes
 
 // ---------------------------------------------------------------------------
 // Daily Cron Job
