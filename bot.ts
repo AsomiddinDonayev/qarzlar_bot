@@ -39,10 +39,9 @@ const db: SupabaseClient = createClient(SUPA_URL, SUPA_KEY, {
 });
 
 // ---------------------------------------------------------------------------
-// In-Memory States for Support & Feedback
+// In-Memory States for Taklif / Shikoyat / Izoh
 // ---------------------------------------------------------------------------
-const waitingForSupport = new Set<number>();
-const waitingForFeedback = new Set<number>();
+const userFeedbackType = new Map<number, string>();
 
 // ---------------------------------------------------------------------------
 // Types & Interfaces
@@ -67,7 +66,7 @@ interface DueDebt {
 }
 
 // ---------------------------------------------------------------------------
-// Database Helpers & Smart Features
+// Database Helpers
 // ---------------------------------------------------------------------------
 
 async function getUser(telegramId: number): Promise<UserRow | null> {
@@ -163,55 +162,6 @@ async function getOwnerTelegramId(businessId: string): Promise<number | null> {
   return data?.telegram_id ?? null;
 }
 
-// 🟢 1. Mijozning ishonchlilik reytingi
-async function calculateCustomerRating(customerId: string): Promise<string> {
-  const { data: debts } = await db
-    .from("debts")
-    .select("status, due_date, updated_at")
-    .eq("customer_id", customerId);
-
-  if (!debts || debts.length === 0) return "🟢 Yaxshi";
-
-  const today = new Intl.DateTimeFormat("en-CA", { timeZone: CRON_TZ }).format(new Date());
-  let overdueCount = 0;
-  let unpaidOverdue = 0;
-
-  debts.forEach((d: any) => {
-    if (d.status === "pending" && d.due_date < today) {
-      unpaidOverdue++;
-    }
-    if (d.status === "paid" && d.updated_at && d.updated_at.slice(0, 10) > d.due_date) {
-      overdueCount++;
-    }
-  });
-
-  if (unpaidOverdue > 0) return "🔴 Xavfli";
-  if (overdueCount > 1) return "🟡 Kechiktiruvchi";
-  return "🟢 Yaxshi";
-}
-
-// 🟢 4. Qismga bo'lib to'lash (Grafik tuzish)
-async function createInstallmentPlan(debtId: string, totalAmount: number, months: number, firstDueDate: string) {
-  const installmentAmount = Math.round(totalAmount / months);
-  const schedules = [];
-  let baseDate = new Date(firstDueDate);
-
-  for (let i = 0; i < months; i++) {
-    const dueDateStr = baseDate.toISOString().slice(0, 10);
-    schedules.push({
-      debt_id: debtId,
-      amount: i === months - 1 ? totalAmount - (installmentAmount * (months - 1)) : installmentAmount,
-      due_date: dueDateStr,
-      status: 'pending'
-    });
-    baseDate.setMonth(baseDate.getMonth() + 1);
-  }
-
-  const { error } = await db.from("debt_schedules").insert(schedules);
-  if (error) throw new Error(`Grafik tuzishda xatolik: ${error.message}`);
-  return true;
-}
-
 // ---------------------------------------------------------------------------
 // Formatters
 // ---------------------------------------------------------------------------
@@ -272,7 +222,7 @@ bot.command("start", async (ctx) => {
           keyboard: [
             [{ text: "📊 Statistika va Hisobotlar" }, { text: "⚙️ Profilni ko'rish" }],
             [{ text: "📒 Nasiya Daftarini ochish (WebApp)" }],
-            [{ text: "💬 Adminga murojaat" }, { text: "⭐ Fikr bildirish" }]
+            [{ text: "💬 Taklif va Shikoyatlar" }]
           ],
           resize_keyboard: true,
         },
@@ -307,23 +257,19 @@ bot.command("admin", async (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// Support & Feedback Button Listeners
+// Taklif va Shikoyatlar Menu Listener
 // ---------------------------------------------------------------------------
-bot.hears("💬 Adminga murojaat", async (ctx) => {
+bot.hears("💬 Taklif va Shikoyatlar", async (ctx) => {
   if (!ctx.from) return;
-  waitingForSupport.add(ctx.from.id);
-  waitingForFeedback.delete(ctx.from.id);
-  await ctx.reply("✍️ Adminga yo'llamoqchi bo'lgan murojaatingiz yoki savolingizni yozib yuboring:");
+  await ctx.reply("Ariza turini tanlang:", {
+    reply_markup: new InlineKeyboard()
+      .text("⚠️ Shikoyat", "fb_type:shikoyat")
+      .text("💡 Taklif", "fb_type:taklif")
+      .text("💬 Izoh", "fb_type:izoh")
+  });
 });
 
-bot.hears("⭐ Fikr bildirish", async (ctx) => {
-  if (!ctx.from) return;
-  waitingForFeedback.add(ctx.from.id);
-  waitingForSupport.delete(ctx.from.id);
-  await ctx.reply("📝 Bot haqida o'z fikringiz, taklifingiz yoki shikoyatingizni yozib qoldiring:");
-});
-
-// Capture text messages for support/feedback
+// Capture text messages when user is typing their feedback/complaint
 bot.on("message:text", async (ctx, next) => {
   if (!ctx.from) return next();
   const userId = ctx.from.id;
@@ -331,40 +277,32 @@ bot.on("message:text", async (ctx, next) => {
 
   if (text.startsWith("/")) return next();
 
-  if (waitingForSupport.has(userId)) {
-    waitingForSupport.delete(userId);
+  if (userFeedbackType.has(userId)) {
+    const type = userFeedbackType.get(userId)!;
+    userFeedbackType.delete(userId);
+
     await db.from("bot_feedback").insert({
       telegram_id: userId,
       full_name: displayName(ctx.from),
       text: text,
-      type: "support"
+      type: type
     });
 
-    await ctx.reply("✅ Murojaatingiz adminga yuborildi. Tez orada javob beramiz!");
+    const typeNames: Record<string, string> = {
+      shikoyat: "Shikoyatingiz",
+      taklif: "Taklifingiz",
+      izoh: "Izohingiz"
+    };
+
+    await ctx.reply(`✅ ${typeNames[type] || "Murojaatingiz"} muvaffaqiyatli qabul qilindi! Rahmad.`);
+
     if (ADMIN_TELEGRAM_ID) {
+      const typeEmoji: Record<string, string> = { shikoyat: "⚠️", taklif: "💡", izoh: "💬" };
       await bot.api.sendMessage(
         ADMIN_TELEGRAM_ID,
-        `📬 <b>Yangi Murojaat!</b>\n\n👤 Kimdan: ${displayName(ctx.from)} (<code>${userId}</code>)\n💬 Matn: ${text}`,
-        { parse_mode: "HTML" }
-      );
-    }
-    return;
-  }
-
-  if (waitingForFeedback.has(userId)) {
-    waitingForFeedback.delete(userId);
-    await db.from("bot_feedback").insert({
-      telegram_id: userId,
-      full_name: displayName(ctx.from),
-      text: text,
-      type: "feedback"
-    });
-
-    await ctx.reply("⭐ Fikringiz uchun rahmat! Botni yanada yaxshilashga yordam berganingizdan xursandmiz.");
-    if (ADMIN_TELEGRAM_ID) {
-      await bot.api.sendMessage(
-        ADMIN_TELEGRAM_ID,
-        `⭐ <b>Yangi Fikr-mulohaza!</b>\n\n👤 Kimdan: ${displayName(ctx.from)} (<code>${userId}</code>)\n📝 Matn: ${text}`,
+        `${typeEmoji[type] || '📬'} <b>Yangi ${type.toUpperCase()}!</b>\n\n` +
+        `👤 Kimdan: ${displayName(ctx.from)} (<code>${userId}</code>)\n` +
+        `📝 Matn: ${text}`,
         { parse_mode: "HTML" }
       );
     }
@@ -454,11 +392,30 @@ bot.hears("📊 Statistika va Hisobotlar", async (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// Callbacks (Pay, Defer & Admin Actions)
+// Callbacks (Feedback types, Pay, Defer & Admin Actions)
 // ---------------------------------------------------------------------------
 bot.on("callback_query:data", async (ctx) => {
   if (!ctx.from) return;
   const data = ctx.callbackQuery.data;
+
+  // Feedback Type Selection
+  if (data.startsWith("fb_type:")) {
+    const type = data.split(":")[1];
+    userFeedbackType.set(ctx.from.id, type);
+    await ctx.answerCallbackQuery();
+    
+    const titles: Record<string, string> = {
+      shikoyat: "Shikoyat",
+      taklif: "Taklif",
+      izoh: "Izoh"
+    };
+
+    await ctx.editMessageText(
+      `Iltimos, o'z <b>${titles[type] || 'murojaatingiz'}</b> matnini shu yerga yozib yuboring:`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
 
   // Admin Panel Actions
   if (data.startsWith("admin:")) {
@@ -468,7 +425,6 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     if (data === "admin:stats") {
-      // Bizneslar aktivligini tekshirish
       const { data: businesses } = await db.from("businesses").select("id, name, phone, created_at");
       const { data: allDebts } = await db.from("debts").select("business_id, created_at");
 
@@ -505,7 +461,7 @@ bot.on("callback_query:data", async (ctx) => {
         .from("bot_feedback")
         .select("full_name, telegram_id, text, type, created_at")
         .order("created_at", { ascending: false })
-        .limit(5);
+        .limit(10);
 
       if (!msgs || msgs.length === 0) {
         await ctx.answerCallbackQuery({ text: "Murojaatlar yo'q" });
