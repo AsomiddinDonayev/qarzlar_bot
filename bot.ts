@@ -319,15 +319,7 @@ cron.schedule(CRON_SCHED, () => void sendReminders(), { timezone: CRON_TZ });
 const app = express();
 const PORT = Number(process.env.PORT) || 10000;
 
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(",").map((s) => s.trim())
-  : "*";
-
-app.use(cors({
-  origin: allowedOrigins,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-telegram-init-data"]
-}));
+app.use(cors()); // Barcha domen va header'larga to'liq ruxsat berish
 app.use(express.json());
 
 // Telegram Webhook Marshruti
